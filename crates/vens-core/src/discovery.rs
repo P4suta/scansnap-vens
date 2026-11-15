@@ -1,5 +1,5 @@
 use crate::{
-    HostId, Ipv4Address, MacAddress, Port,
+    DecodeError, HostId, Ipv4Address, MacAddress, Port,
     wire::{INTERFACE_VERSION, KEY, field, put},
 };
 
@@ -105,14 +105,6 @@ impl<const N: usize> Text<N> {
         let text = core::str::from_utf8(self.0.get(..length)?).ok()?;
         Some(text.trim_end())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecodeError {
-    Truncated { expected: usize, actual: usize },
-    ForeignKey,
-    NotAReply,
-    PortOutOfRange { value: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

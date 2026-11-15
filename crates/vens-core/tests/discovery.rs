@@ -1,8 +1,8 @@
 //! Layouts follow sections 5.1 and 5.2 of the ix1300-wifi protocol document, both marked as verified on hardware.
 
 use vens_core::{
-    HostId, Ipv4Address, MacAddress, Port,
-    discovery::{Availability, DecodeError, Password, Probe, SearchReply},
+    DecodeError, HostId, Ipv4Address, MacAddress, Port,
+    discovery::{Availability, Password, Probe, SearchReply},
 };
 
 const HOST: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
