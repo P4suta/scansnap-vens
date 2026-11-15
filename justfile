@@ -11,3 +11,6 @@ check:
 
 fmt:
     cargo fmt --all
+
+hardware-probe *target:
+    cargo run --locked -p vens-net --example probe -- {{ target }}
