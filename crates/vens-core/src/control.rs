@@ -1,7 +1,7 @@
 use core::ops::RangeInclusive;
 
 use crate::{
-    DecodeError, HostId, Ipv4Address, MacAddress, Port,
+    FrameError, HostId, Ipv4Address, MacAddress, Port,
     wire::{INTERFACE_VERSION, KEY, keyed_field, put},
 };
 
@@ -170,7 +170,7 @@ impl ReserveReply {
     /// # Errors
     ///
     /// Refuses a frame that is shorter than a reserve reply or carries another key.
-    pub fn decode(frame: &[u8]) -> Result<Self, DecodeError> {
+    pub fn decode(frame: &[u8]) -> Result<Self, FrameError> {
         keyed_field(frame, RESERVE_REPLY_LENGTH, FRAME_KEY, RESULT).map(|result| Self {
             result: i32::from_be_bytes(result),
         })
@@ -227,7 +227,7 @@ impl ReleaseReply {
     /// # Errors
     ///
     /// Refuses a frame that is shorter than a release reply or carries another key.
-    pub fn decode(frame: &[u8]) -> Result<Self, DecodeError> {
+    pub fn decode(frame: &[u8]) -> Result<Self, FrameError> {
         keyed_field(frame, RELEASE_REPLY_LENGTH, FRAME_KEY, RESULT).map(|result| Self {
             result: i32::from_be_bytes(result),
         })
@@ -251,7 +251,7 @@ impl Greeting {
     /// # Errors
     ///
     /// Refuses a frame that is shorter than a greeting or carries another key.
-    pub fn decode(frame: &[u8]) -> Result<Self, DecodeError> {
+    pub fn decode(frame: &[u8]) -> Result<Self, FrameError> {
         keyed_field::<4>(frame, GREETING_LENGTH, FRAME_KEY, LENGTH).map(|_| Self)
     }
 }

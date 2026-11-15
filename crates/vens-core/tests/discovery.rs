@@ -1,8 +1,8 @@
 //! Layouts follow sections 5.1 and 5.2 of the ix1300-wifi protocol document, both marked as verified on hardware.
 
 use vens_core::{
-    DecodeError, HostId, Ipv4Address, MacAddress, Port,
-    discovery::{Availability, Password, Probe, SearchReply},
+    FrameError, HostId, Ipv4Address, MacAddress, Port,
+    discovery::{Availability, Password, Probe, SearchReply, SearchReplyError},
 };
 
 const HOST: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
@@ -112,10 +112,10 @@ fn a_truncated_reply_is_refused() {
     let frame = reply();
     assert_eq!(
         SearchReply::decode(frame.get(..143).unwrap_or_default()).err(),
-        Some(DecodeError::Truncated {
+        Some(SearchReplyError::Frame(FrameError::Truncated {
             expected: REPLY_LENGTH,
             actual: 143,
-        })
+        }))
     );
 }
 
@@ -125,7 +125,7 @@ fn a_reply_with_a_foreign_key_is_refused() {
     put(&mut frame, 0, b"SNEV");
     assert_eq!(
         SearchReply::decode(&frame).err(),
-        Some(DecodeError::ForeignKey)
+        Some(SearchReplyError::Frame(FrameError::ForeignKey))
     );
 }
 
@@ -135,7 +135,7 @@ fn a_reply_marked_invalid_is_refused() {
     put(&mut frame, 6, &[0xFF, 0xFF]);
     assert_eq!(
         SearchReply::decode(&frame).err(),
-        Some(DecodeError::NotAReply)
+        Some(SearchReplyError::NotAReply)
     );
 }
 
@@ -145,6 +145,6 @@ fn a_port_beyond_sixteen_bits_is_refused() {
     put(&mut frame, 20, &65536_u32.to_be_bytes());
     assert_eq!(
         SearchReply::decode(&frame).err(),
-        Some(DecodeError::PortOutOfRange { value: 65536 })
+        Some(SearchReplyError::PortOutOfRange { value: 65536 })
     );
 }

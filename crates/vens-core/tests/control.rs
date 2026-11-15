@@ -1,7 +1,7 @@
 //! Layouts follow sections 4, 5.3, and 5.4 of the ix1300-wifi protocol document, all marked as verified on hardware.
 
 use vens_core::{
-    DecodeError, HostId, Ipv4Address, MacAddress, Port,
+    FrameError, HostId, Ipv4Address, MacAddress, Port,
     control::{
         Greeting, LocalTime, Release, ReleaseReply, Reserve, ReserveMode, ReserveRefusal,
         ReserveReply, UtcOffset,
@@ -143,13 +143,13 @@ fn a_greeting_is_accepted_only_in_its_documented_form() {
     assert_eq!(Greeting::decode(&greeting), Ok(Greeting));
     assert_eq!(
         Greeting::decode(greeting.get(..15).unwrap_or_default()),
-        Err(DecodeError::Truncated {
+        Err(FrameError::Truncated {
             expected: 16,
             actual: 15,
         })
     );
     put(&mut greeting, 4, b"SNEV");
-    assert_eq!(Greeting::decode(&greeting), Err(DecodeError::ForeignKey));
+    assert_eq!(Greeting::decode(&greeting), Err(FrameError::ForeignKey));
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn a_control_reply_with_a_foreign_key_or_short_length_is_refused() {
     let mut frame = reply::<20>(0);
     assert_eq!(
         ReserveReply::decode(frame.get(..19).unwrap_or_default()).err(),
-        Some(DecodeError::Truncated {
+        Some(FrameError::Truncated {
             expected: 20,
             actual: 19,
         })
@@ -165,6 +165,6 @@ fn a_control_reply_with_a_foreign_key_or_short_length_is_refused() {
     put(&mut frame, 4, b"SNEV");
     assert_eq!(
         ReserveReply::decode(&frame).err(),
-        Some(DecodeError::ForeignKey)
+        Some(FrameError::ForeignKey)
     );
 }

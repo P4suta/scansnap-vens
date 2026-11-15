@@ -1,8 +1,8 @@
 //! Layouts follow sections 7.1 and 7.2 of the ix1300-wifi protocol document, both marked as verified on hardware.
 
 use vens_core::{
-    DecodeError, Ipv4Address, MacAddress,
-    command::{Cdb, ReplyHeader, Request, ScsiStatus},
+    FrameError, Ipv4Address, MacAddress,
+    command::{Cdb, ReplyHeader, ReplyHeaderError, Request, ScsiStatus},
 };
 
 const HOST: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
@@ -96,7 +96,7 @@ fn a_reply_header_yields_the_status_and_the_payload_length() {
 fn a_reply_header_in_a_refused_frame_is_an_error() {
     assert_eq!(
         ReplyHeader::decode(&reply(40, 7, 0)).err(),
-        Some(DecodeError::FrameRefused { status: 7 })
+        Some(ReplyHeaderError::Refused { status: 7 })
     );
 }
 
@@ -104,15 +104,15 @@ fn a_reply_header_in_a_refused_frame_is_an_error() {
 fn a_reply_header_shorter_than_its_own_header_is_an_error() {
     assert_eq!(
         ReplyHeader::decode(&reply(39, 0, 0)).err(),
-        Some(DecodeError::LengthBelowHeader { declared: 39 })
+        Some(ReplyHeaderError::LengthBelowHeader { declared: 39 })
     );
     let frame = reply(40, 0, 0);
     assert_eq!(
         ReplyHeader::decode(frame.get(..39).unwrap_or_default()).err(),
-        Some(DecodeError::Truncated {
+        Some(ReplyHeaderError::Frame(FrameError::Truncated {
             expected: 40,
             actual: 39,
-        })
+        }))
     );
 }
 
@@ -122,6 +122,6 @@ fn a_reply_header_with_a_foreign_key_is_an_error() {
     put(&mut frame, 4, b"SNEV");
     assert_eq!(
         ReplyHeader::decode(&frame).err(),
-        Some(DecodeError::ForeignKey)
+        Some(ReplyHeaderError::Frame(FrameError::ForeignKey))
     );
 }

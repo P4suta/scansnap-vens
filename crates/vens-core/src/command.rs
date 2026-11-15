@@ -1,5 +1,5 @@
 use crate::{
-    DecodeError, Ipv4Address, MacAddress,
+    FrameError, Ipv4Address, MacAddress,
     wire::{KEY, keyed_field, put},
 };
 
@@ -123,26 +123,35 @@ pub struct ReplyHeader {
     payload_length: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyHeaderError {
+    Frame(FrameError),
+    Refused { status: u32 },
+    LengthBelowHeader { declared: u32 },
+}
+
+fn header_field(frame: &[u8], offset: usize) -> Result<u32, ReplyHeaderError> {
+    keyed_field(frame, REPLY_LENGTH, FRAME_KEY, offset)
+        .map(u32::from_be_bytes)
+        .map_err(ReplyHeaderError::Frame)
+}
+
 impl ReplyHeader {
     /// # Errors
     ///
     /// Refuses a header that is truncated, carries another key, reports a refused frame, or declares a length below its own size.
-    pub fn decode(frame: &[u8]) -> Result<Self, DecodeError> {
-        let frame_status = keyed_field(frame, REPLY_LENGTH, FRAME_KEY, REPLY_FRAME_STATUS)
-            .map(u32::from_be_bytes)?;
+    pub fn decode(frame: &[u8]) -> Result<Self, ReplyHeaderError> {
+        let frame_status = header_field(frame, REPLY_FRAME_STATUS)?;
         if frame_status != FRAME_ACCEPTED {
-            return Err(DecodeError::FrameRefused {
+            return Err(ReplyHeaderError::Refused {
                 status: frame_status,
             });
         }
-        let declared =
-            keyed_field(frame, REPLY_LENGTH, FRAME_KEY, LENGTH).map(u32::from_be_bytes)?;
+        let declared = header_field(frame, LENGTH)?;
         let payload_length = declared
             .checked_sub(REPLY_HEADER)
-            .ok_or(DecodeError::LengthBelowHeader { declared })?;
-        let status = match keyed_field(frame, REPLY_LENGTH, FRAME_KEY, REPLY_SCSI_STATUS)
-            .map(u32::from_be_bytes)?
-        {
+            .ok_or(ReplyHeaderError::LengthBelowHeader { declared })?;
+        let status = match header_field(frame, REPLY_SCSI_STATUS)? {
             GOOD => ScsiStatus::Good,
             CHECK_CONDITION => ScsiStatus::CheckCondition,
             BUSY => ScsiStatus::Busy,

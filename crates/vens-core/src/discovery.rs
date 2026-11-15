@@ -1,6 +1,6 @@
 use crate::{
-    DecodeError, HostId, Ipv4Address, MacAddress, Port,
-    wire::{INTERFACE_VERSION, KEY, field, put},
+    FrameError, HostId, Ipv4Address, MacAddress, Port,
+    wire::{INTERFACE_VERSION, KEY, field, keyed_field, put},
 };
 
 const PROBE_LENGTH: usize = 32;
@@ -121,30 +121,33 @@ pub struct SearchReply {
     serial: Text<12>,
 }
 
-fn port(value: [u8; 4]) -> Result<Port, DecodeError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchReplyError {
+    Frame(FrameError),
+    NotAReply,
+    PortOutOfRange { value: u32 },
+}
+
+fn port(value: [u8; 4]) -> Result<Port, SearchReplyError> {
     let value = u32::from_be_bytes(value);
     u16::try_from(value)
         .map(Port::new)
-        .map_err(|_| DecodeError::PortOutOfRange { value })
+        .map_err(|_| SearchReplyError::PortOutOfRange { value })
 }
 
 impl SearchReply {
     /// # Errors
     ///
     /// Refuses a frame that is shorter than a search reply, carries another key, is marked invalid by the scanner, or names a port beyond sixteen bits.
-    pub fn decode(frame: &[u8]) -> Result<Self, DecodeError> {
-        let truncated = DecodeError::Truncated {
+    pub fn decode(frame: &[u8]) -> Result<Self, SearchReplyError> {
+        let truncated = SearchReplyError::Frame(FrameError::Truncated {
             expected: REPLY_LENGTH,
             actual: frame.len(),
-        };
-        if frame.len() < REPLY_LENGTH {
-            return Err(truncated);
-        }
-        if field(frame, REPLY_KEY) != Some(KEY) {
-            return Err(DecodeError::ForeignKey);
-        }
-        if field(frame, REPLY_VALIDITY) == Some(INVALID_REPLY) {
-            return Err(DecodeError::NotAReply);
+        });
+        let validity: [u8; 2] = keyed_field(frame, REPLY_LENGTH, REPLY_KEY, REPLY_VALIDITY)
+            .map_err(SearchReplyError::Frame)?;
+        if validity == INVALID_REPLY {
+            return Err(SearchReplyError::NotAReply);
         }
         let password = match field(frame, REPLY_PASSWORD).map(u32::from_be_bytes) {
             Some(NO_PASSWORD) => Password::NotSet,

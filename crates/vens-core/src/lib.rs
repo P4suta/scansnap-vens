@@ -8,4 +8,4 @@ pub mod scan;
 mod wire;
 
 pub use identity::{HostId, Ipv4Address, MacAddress, Port};
-pub use wire::DecodeError;
+pub use wire::FrameError;
