@@ -7,6 +7,8 @@ pub enum DecodeError {
     ForeignKey,
     NotAReply,
     PortOutOfRange { value: u32 },
+    FrameRefused { status: u32 },
+    LengthBelowHeader { declared: u32 },
 }
 
 pub(crate) fn put(frame: &mut [u8], offset: usize, bytes: &[u8]) {
