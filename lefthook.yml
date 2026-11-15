@@ -1,0 +1,8 @@
+pre-commit:
+  commands:
+    format:
+      run: mise x -- cargo fmt --all -- --check
+pre-push:
+  commands:
+    check:
+      run: mise x -- just check
