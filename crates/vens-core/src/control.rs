@@ -33,6 +33,8 @@ const RELEASE_COMMAND: u32 = 0x12;
 const RELEASE_REPLY_LENGTH: usize = 16;
 
 const GREETING_LENGTH: usize = 16;
+const GREETING_STATUS: usize = 8;
+const GREETING_ACCEPTED: u32 = 0;
 
 const MONTHS: RangeInclusive<u8> = 1..=12;
 const DAYS: RangeInclusive<u8> = 1..=31;
@@ -247,11 +249,24 @@ impl ReleaseReply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Greeting;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GreetingError {
+    Frame(FrameError),
+    Refused { status: u32 },
+}
+
 impl Greeting {
     /// # Errors
     ///
-    /// Refuses a frame that is shorter than a greeting or carries another key.
-    pub fn decode(frame: &[u8]) -> Result<Self, FrameError> {
-        keyed_field::<4>(frame, GREETING_LENGTH, FRAME_KEY, LENGTH).map(|_| Self)
+    /// Refuses a frame that is shorter than a greeting, carries another key, or reports a status other than zero.
+    pub fn decode(frame: &[u8]) -> Result<Self, GreetingError> {
+        let status = keyed_field(frame, GREETING_LENGTH, FRAME_KEY, GREETING_STATUS)
+            .map(u32::from_be_bytes)
+            .map_err(GreetingError::Frame)?;
+        if status == GREETING_ACCEPTED {
+            Ok(Self)
+        } else {
+            Err(GreetingError::Refused { status })
+        }
     }
 }

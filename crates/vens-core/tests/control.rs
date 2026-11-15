@@ -3,8 +3,8 @@
 use vens_core::{
     FrameError, HostId, Ipv4Address, MacAddress, Port,
     control::{
-        Greeting, LocalTime, Release, ReleaseReply, Reserve, ReserveMode, ReserveRefusal,
-        ReserveReply, UtcOffset,
+        Greeting, GreetingError, LocalTime, Release, ReleaseReply, Reserve, ReserveMode,
+        ReserveRefusal, ReserveReply, UtcOffset,
     },
 };
 
@@ -143,13 +143,21 @@ fn a_greeting_is_accepted_only_in_its_documented_form() {
     assert_eq!(Greeting::decode(&greeting), Ok(Greeting));
     assert_eq!(
         Greeting::decode(greeting.get(..15).unwrap_or_default()),
-        Err(FrameError::Truncated {
+        Err(GreetingError::Frame(FrameError::Truncated {
             expected: 16,
             actual: 15,
-        })
+        }))
+    );
+    put(&mut greeting, 8, &5_u32.to_be_bytes());
+    assert_eq!(
+        Greeting::decode(&greeting),
+        Err(GreetingError::Refused { status: 5 })
     );
     put(&mut greeting, 4, b"SNEV");
-    assert_eq!(Greeting::decode(&greeting), Err(FrameError::ForeignKey));
+    assert_eq!(
+        Greeting::decode(&greeting),
+        Err(GreetingError::Frame(FrameError::ForeignKey))
+    );
 }
 
 #[test]
