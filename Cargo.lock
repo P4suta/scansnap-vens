@@ -11,5 +11,12 @@ name = "vens-core"
 version = "0.0.0"
 
 [[package]]
+name = "vens-net"
+version = "0.0.0"
+dependencies = [
+ "vens-core",
+]
+
+[[package]]
 name = "xtask"
 version = "0.0.0"
