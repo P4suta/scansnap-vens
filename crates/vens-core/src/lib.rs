@@ -4,6 +4,7 @@ pub mod command;
 pub mod control;
 pub mod discovery;
 mod identity;
+pub mod scan;
 mod wire;
 
 pub use identity::{HostId, Ipv4Address, MacAddress, Port};
