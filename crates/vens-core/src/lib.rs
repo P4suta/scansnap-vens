@@ -4,6 +4,7 @@ pub mod command;
 pub mod control;
 pub mod discovery;
 mod identity;
+pub mod image;
 pub mod scan;
 pub mod sense;
 pub mod status;
