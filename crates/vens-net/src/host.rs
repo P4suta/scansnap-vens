@@ -1,13 +1,90 @@
 use std::{
+    fs,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
+    path::PathBuf,
+    thread,
     time::Duration,
 };
 
-use crate::{channel::Stream, search::Datagram};
+use vens_core::{
+    job::Pause,
+    jpeg::{self, JpegError},
+    scan::Side,
+};
+
+use crate::{
+    channel::Stream,
+    scan::{Clock, PageSink},
+    search::Datagram,
+};
 
 const ANY_PORT: u16 = 0;
 const DISCARD_PORT: u16 = 9;
+const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Default)]
+pub struct SleepingClock;
+
+impl Clock for SleepingClock {
+    fn wait(&mut self, pause: Pause) {
+        match pause {
+            Pause::NoDataYet | Pause::Busy => thread::sleep(RETRY_INTERVAL),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SinkError {
+    Io(io::Error),
+    Image(JpegError),
+}
+
+#[derive(Debug)]
+pub struct DirectorySink {
+    directory: PathBuf,
+    image: Vec<u8>,
+    written: Vec<PathBuf>,
+}
+
+impl DirectorySink {
+    #[must_use]
+    pub const fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            image: Vec::new(),
+            written: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn written(&self) -> &[PathBuf] {
+        &self.written
+    }
+}
+
+impl PageSink for DirectorySink {
+    type Error = SinkError;
+
+    fn append(&mut self, _: u32, _: Side, data: &[u8]) -> Result<(), SinkError> {
+        self.image.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self, sheet: u32, side: Side, height: u16) -> Result<(), SinkError> {
+        let mut image = std::mem::take(&mut self.image);
+        jpeg::set_height(&mut image, height).map_err(SinkError::Image)?;
+        let side = match side {
+            Side::Front => "front",
+            Side::Back => "back",
+        };
+        let number = sheet.saturating_add(1);
+        let path = self.directory.join(format!("sheet-{number:03}-{side}.jpg"));
+        fs::write(&path, &image).map_err(SinkError::Io)?;
+        self.written.push(path);
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct UdpPort(UdpSocket);
