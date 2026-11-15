@@ -17,7 +17,6 @@ const REQUEST_DATA_OUT: usize = 40;
 const REQUEST_CDB: usize = 48;
 const ONE_CDB: u32 = 1;
 
-const CDB_CAPACITY: usize = 16;
 const SIX_BYTES: u32 = 6;
 const TEN_BYTES: u32 = 10;
 const TWELVE_BYTES: u32 = 12;
@@ -32,33 +31,27 @@ const CHECK_CONDITION: u32 = 2;
 const BUSY: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cdb {
-    bytes: [u8; CDB_CAPACITY],
-    length: u32,
+pub enum Cdb {
+    Six([u8; 6]),
+    Ten([u8; 10]),
+    Twelve([u8; 12]),
 }
 
 impl Cdb {
     #[must_use]
-    pub fn six(bytes: [u8; 6]) -> Self {
-        Self::padded(&bytes, SIX_BYTES)
+    pub const fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Six(bytes) => bytes,
+            Self::Ten(bytes) => bytes,
+            Self::Twelve(bytes) => bytes,
+        }
     }
 
-    #[must_use]
-    pub fn ten(bytes: [u8; 10]) -> Self {
-        Self::padded(&bytes, TEN_BYTES)
-    }
-
-    #[must_use]
-    pub fn twelve(bytes: [u8; 12]) -> Self {
-        Self::padded(&bytes, TWELVE_BYTES)
-    }
-
-    fn padded(bytes: &[u8], length: u32) -> Self {
-        let mut block = [0; CDB_CAPACITY];
-        put(&mut block, 0, bytes);
-        Self {
-            bytes: block,
-            length,
+    const fn length(&self) -> u32 {
+        match self {
+            Self::Six(_) => SIX_BYTES,
+            Self::Ten(_) => TEN_BYTES,
+            Self::Twelve(_) => TWELVE_BYTES,
         }
     }
 }
@@ -107,11 +100,11 @@ impl Request {
         put(
             &mut frame,
             REQUEST_CDB_LENGTH,
-            &self.cdb.length.to_be_bytes(),
+            &self.cdb.length().to_be_bytes(),
         );
         put(&mut frame, REQUEST_DATA_IN, &self.data_in.to_be_bytes());
         put(&mut frame, REQUEST_DATA_OUT, &data_out.to_be_bytes());
-        put(&mut frame, REQUEST_CDB, &self.cdb.bytes);
+        put(&mut frame, REQUEST_CDB, self.cdb.bytes());
         frame
     }
 }

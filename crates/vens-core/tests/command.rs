@@ -39,7 +39,7 @@ fn a_request_without_data_out_matches_the_documented_header() {
     put(&mut expected, 36, &0x30_u32.to_be_bytes());
     put(&mut expected, 48, &HARDWARE_STATUS);
     assert_eq!(
-        Request::new(HOST_MAC, HOST, Cdb::ten(HARDWARE_STATUS))
+        Request::new(HOST_MAC, HOST, Cdb::Ten(HARDWARE_STATUS))
             .expecting(0x30)
             .encode(),
         expected
@@ -58,7 +58,7 @@ fn a_request_with_data_out_counts_it_in_the_total_length() {
     put(&mut expected, 40, &0x50_u32.to_be_bytes());
     put(&mut expected, 48, &SCAN_PARAMETERS);
     assert_eq!(
-        Request::new(HOST_MAC, HOST, Cdb::six(SCAN_PARAMETERS))
+        Request::new(HOST_MAC, HOST, Cdb::Six(SCAN_PARAMETERS))
             .sending(0x50)
             .encode(),
         expected
@@ -68,7 +68,7 @@ fn a_request_with_data_out_counts_it_in_the_total_length() {
 #[test]
 fn a_twelve_byte_command_block_keeps_its_length() {
     let read = [0x28, 0, 0, 0, 0, 0x80, 0x30, 0, 0, 0, 1, 0];
-    let frame = Request::new(HOST_MAC, HOST, Cdb::twelve(read))
+    let frame = Request::new(HOST_MAC, HOST, Cdb::Twelve(read))
         .expecting(0x0030_0000)
         .encode();
     assert_eq!(frame.get(32..36), Some(12_u32.to_be_bytes().as_slice()));
