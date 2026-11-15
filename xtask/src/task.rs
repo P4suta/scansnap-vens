@@ -1,17 +1,22 @@
 use std::{fmt, io};
 
-use crate::fixture::{Expectation, Fixture, FixtureError, Observation, judge};
+use crate::{
+    dependencies::{self, CacheError},
+    fixture::{Expectation, Fixture, FixtureError, Observation, judge},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Task {
     Check,
     StaticTypes,
+    Dependencies,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Run(&'static [Step]),
     Judge(&'static [Fixture]),
+    Dependencies,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +42,7 @@ pub(crate) enum StepError {
 pub(crate) enum TaskError {
     Step(StepError),
     Fixture(FixtureError),
+    Cache(CacheError),
 }
 
 pub(crate) trait Runner {
@@ -75,6 +81,7 @@ const NATIVE: &[Step] = &[
     },
 ];
 
+const TASK_NAMES: &str = "check, static-types, or dependencies";
 const LINT_FIXTURE_PACKAGE: &str = "lint-fixtures";
 
 macro_rules! lint_fixture {
@@ -187,6 +194,7 @@ impl Task {
         let task = match name.as_str() {
             "check" => Self::Check,
             "static-types" => Self::StaticTypes,
+            "dependencies" => Self::Dependencies,
             _ => return Err(UsageError::Unknown(name)),
         };
         match arguments.next() {
@@ -202,11 +210,13 @@ impl Task {
                 Stage::Judge(LINT_FIXTURES),
                 Stage::Judge(STATIC_TYPE_FIXTURES),
                 Stage::Run(WORKSPACE_STATIC_TYPES),
+                Stage::Dependencies,
             ],
             Self::StaticTypes => &[
                 Stage::Judge(STATIC_TYPE_FIXTURES),
                 Stage::Run(WORKSPACE_STATIC_TYPES),
             ],
+            Self::Dependencies => &[Stage::Dependencies],
         }
     }
 }
@@ -220,6 +230,7 @@ pub(crate) fn execute(task: Task, runner: &mut impl Runner) -> Result<(), TaskEr
             let observation = runner.observe(fixture.step).map_err(TaskError::Step)?;
             judge(*fixture, observation).map_err(TaskError::Fixture)
         }),
+        Stage::Dependencies => dependencies::check(runner),
     })
 }
 
@@ -228,6 +239,7 @@ impl fmt::Display for TaskError {
         match self {
             Self::Step(error) => error.fmt(formatter),
             Self::Fixture(error) => error.fmt(formatter),
+            Self::Cache(error) => error.fmt(formatter),
         }
     }
 }
@@ -244,11 +256,10 @@ impl fmt::Display for Step {
 impl fmt::Display for UsageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing => formatter.write_str("expected a task name: check or static-types"),
-            Self::Unknown(name) => write!(
-                formatter,
-                "unknown task: {name}; expected check or static-types"
-            ),
+            Self::Missing => write!(formatter, "expected a task name: {TASK_NAMES}"),
+            Self::Unknown(name) => {
+                write!(formatter, "unknown task: {name}; expected {TASK_NAMES}")
+            }
             Self::Trailing(extra) => write!(formatter, "unexpected argument: {extra}"),
         }
     }
@@ -277,8 +288,10 @@ mod tests {
         LINT_FIXTURES, Runner, STATIC_TYPE_FIXTURES, Step, StepError, Task, TaskError, UsageError,
         execute,
     };
-    use crate::fixture::Fixture;
-    use crate::fixture::{Expectation, FixtureError, Observation};
+    use crate::{
+        dependencies,
+        fixture::{Expectation, Fixture, FixtureError, Observation},
+    };
 
     fn arguments(values: &[&str]) -> impl Iterator<Item = String> {
         values.iter().map(|value| (*value).to_owned())
@@ -336,14 +349,21 @@ mod tests {
                 .chain(LINT_FIXTURES)
                 .find(|fixture| fixture.step == step)
                 .map(|fixture| fixture.expectation);
+            let output = if step == dependencies::REMOTE {
+                dependencies::ORIGIN
+            } else {
+                ""
+            };
             Ok(match (self.lint, expectation) {
                 (Lint::Faithful, Some(Expectation::Rejected { marker })) => Observation {
                     success: false,
+                    output: String::new(),
                     diagnostic: marker.to_owned(),
                 },
                 (Lint::Faithful, Some(Expectation::Accepted) | None)
                 | (Lint::AcceptsEverything, _) => Observation {
                     success: true,
+                    output: output.to_owned(),
                     diagnostic: String::new(),
                 },
             })
@@ -377,6 +397,21 @@ mod tests {
             Task::parse(arguments(&["static-types"])),
             Ok(Task::StaticTypes)
         );
+    }
+
+    #[test]
+    fn parses_the_dependencies_task() {
+        assert_eq!(
+            Task::parse(arguments(&["dependencies"])),
+            Ok(Task::Dependencies)
+        );
+    }
+
+    #[test]
+    fn check_ends_with_the_dependency_policy() {
+        let mut recorder = Recorder::new(Lint::Faithful, None);
+        assert_eq!(execute(Task::Check, &mut recorder), Ok(()));
+        assert_eq!(recorder.seen.last(), Some(&dependencies::UNUSED));
     }
 
     fn stated(fixtures: &[Fixture]) -> Vec<String> {
@@ -461,11 +496,21 @@ mod tests {
         let mut recorder = Recorder::new(Lint::Faithful, None);
         assert_eq!(execute(Task::Check, &mut recorder), Ok(()));
         assert_eq!(
-            recorder.subcommands(),
-            [Some("fmt"), Some("clippy"), Some("test"), Some("dylint")]
+            recorder.subcommands().get(..4),
+            Some([Some("fmt"), Some("clippy"), Some("test"), Some("dylint")].as_slice())
         );
+        let judged = recorder
+            .observed
+            .iter()
+            .filter(|step| {
+                STATIC_TYPE_FIXTURES
+                    .iter()
+                    .chain(LINT_FIXTURES)
+                    .any(|fixture| fixture.step == **step)
+            })
+            .count();
         assert_eq!(
-            recorder.observed.len(),
+            judged,
             STATIC_TYPE_FIXTURES
                 .len()
                 .saturating_add(LINT_FIXTURES.len())

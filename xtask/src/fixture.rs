@@ -18,6 +18,7 @@ pub(crate) struct Fixture {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Observation {
     pub(crate) success: bool,
+    pub(crate) output: String,
     pub(crate) diagnostic: String,
 }
 
@@ -41,6 +42,7 @@ pub(crate) fn judge(fixture: Fixture, observation: Observation) -> Result<(), Fi
     let name = fixture.name;
     let Observation {
         success,
+        output: _,
         diagnostic,
     } = observation;
     match (fixture.expectation, success) {
@@ -110,6 +112,7 @@ mod tests {
     fn observation(success: bool, diagnostic: &str) -> Observation {
         Observation {
             success,
+            output: String::new(),
             diagnostic: diagnostic.to_owned(),
         }
     }

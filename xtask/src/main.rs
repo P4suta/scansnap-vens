@@ -1,3 +1,4 @@
+mod dependencies;
 mod fixture;
 mod process;
 mod task;

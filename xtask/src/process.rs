@@ -36,6 +36,7 @@ impl Runner for Host {
         })?;
         Ok(Observation {
             success: output.status.success(),
+            output: String::from_utf8_lossy(&output.stdout).into_owned(),
             diagnostic: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
