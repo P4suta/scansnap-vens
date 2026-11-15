@@ -80,6 +80,30 @@ fn a_registration_reserve_differs_only_in_its_mode() {
 }
 
 #[test]
+fn seconds_since_the_unix_epoch_convert_to_the_civil_date_and_time() {
+    let known = [
+        (0, LocalTime::new(1970, 1, 1, 0, 0, 0)),
+        (86_399, LocalTime::new(1970, 1, 1, 23, 59, 59)),
+        (951_782_400, LocalTime::new(2000, 2, 29, 0, 0, 0)),
+        (1_700_000_000, LocalTime::new(2023, 11, 14, 22, 13, 20)),
+        (4_102_444_800, LocalTime::new(2100, 1, 1, 0, 0, 0)),
+        (4_107_542_399, LocalTime::new(2100, 2, 28, 23, 59, 59)),
+        (4_107_542_400, LocalTime::new(2100, 3, 1, 0, 0, 0)),
+        (2_005_949_145_599, LocalTime::new(65535, 12, 31, 23, 59, 59)),
+    ];
+    for (seconds, expected) in known {
+        assert_eq!(LocalTime::from_unix_seconds(seconds), expected);
+        assert!(expected.is_some());
+    }
+}
+
+#[test]
+fn a_time_beyond_the_sixteen_bit_year_is_refused() {
+    assert_eq!(LocalTime::from_unix_seconds(u64::MAX), None);
+    assert_eq!(LocalTime::from_unix_seconds(2_005_949_145_600), None);
+}
+
+#[test]
 fn a_local_time_outside_the_calendar_is_refused() {
     assert_eq!(LocalTime::new(2026, 13, 1, 0, 0, 0), None);
     assert_eq!(LocalTime::new(2026, 0, 1, 0, 0, 0), None);

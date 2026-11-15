@@ -36,6 +36,24 @@ const GREETING_LENGTH: usize = 16;
 const GREETING_STATUS: usize = 8;
 const GREETING_ACCEPTED: u32 = 0;
 
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 3_600;
+const SECONDS_PER_DAY: u64 = 86_400;
+const DAYS_BEFORE_EPOCH: u64 = 719_468;
+const DAYS_PER_ERA: u64 = 146_097;
+const LAST_DAY_OF_ERA: u64 = 146_096;
+const DAYS_PER_CENTURY: u64 = 36_524;
+const DAYS_PER_FOUR_YEARS: u64 = 1_460;
+const DAYS_PER_YEAR: u64 = 365;
+const DAYS_PER_FIVE_MONTHS: u64 = 153;
+const YEARS_PER_ERA: u64 = 400;
+const YEARS_PER_CENTURY: u64 = 100;
+const YEARS_PER_LEAP: u64 = 4;
+const MONTH_SCALE: u64 = 5;
+const MONTH_BIAS: u64 = 2;
+const MARCH: u64 = 3;
+const MONTHS_FROM_MARCH_TO_DECEMBER: u64 = 10;
+
 const MONTHS: RangeInclusive<u8> = 1..=12;
 const DAYS: RangeInclusive<u8> = 1..=31;
 const HOURS: RangeInclusive<u8> = 0..=23;
@@ -78,6 +96,53 @@ impl LocalTime {
             minute,
             second,
         })
+    }
+
+    /// Converts seconds since the Unix epoch to the proleptic Gregorian date and the time of day.
+    #[must_use]
+    pub fn from_unix_seconds(seconds: u64) -> Option<Self> {
+        let second_of_day = seconds % SECONDS_PER_DAY;
+        let shifted = (seconds / SECONDS_PER_DAY).checked_add(DAYS_BEFORE_EPOCH)?;
+        let era = shifted / DAYS_PER_ERA;
+        let day_of_era = shifted % DAYS_PER_ERA;
+        let year_of_era = day_of_era
+            .checked_sub(day_of_era / DAYS_PER_FOUR_YEARS)?
+            .checked_add(day_of_era / DAYS_PER_CENTURY)?
+            .checked_sub(day_of_era / LAST_DAY_OF_ERA)?
+            / DAYS_PER_YEAR;
+        let year_start = DAYS_PER_YEAR
+            .checked_mul(year_of_era)?
+            .checked_add(year_of_era / YEARS_PER_LEAP)?
+            .checked_sub(year_of_era / YEARS_PER_CENTURY)?;
+        let day_of_year = day_of_era.checked_sub(year_start)?;
+        let month_index = MONTH_SCALE
+            .checked_mul(day_of_year)?
+            .checked_add(MONTH_BIAS)?
+            / DAYS_PER_FIVE_MONTHS;
+        let month_start = DAYS_PER_FIVE_MONTHS
+            .checked_mul(month_index)?
+            .checked_add(MONTH_BIAS)?
+            / MONTH_SCALE;
+        let day = day_of_year.checked_sub(month_start)?.checked_add(1)?;
+        let month = if month_index < MONTHS_FROM_MARCH_TO_DECEMBER {
+            month_index.checked_add(MARCH)?
+        } else {
+            month_index
+                .checked_sub(MONTHS_FROM_MARCH_TO_DECEMBER)?
+                .checked_add(1)?
+        };
+        let year = era
+            .checked_mul(YEARS_PER_ERA)?
+            .checked_add(year_of_era)?
+            .checked_add(u64::from(month < MARCH))?;
+        Self::new(
+            u16::try_from(year).ok()?,
+            u8::try_from(month).ok()?,
+            u8::try_from(day).ok()?,
+            u8::try_from(second_of_day / SECONDS_PER_HOUR).ok()?,
+            u8::try_from(second_of_day % SECONDS_PER_HOUR / SECONDS_PER_MINUTE).ok()?,
+            u8::try_from(second_of_day % SECONDS_PER_MINUTE).ok()?,
+        )
     }
 
     const fn encode(self) -> [u8; 7] {
