@@ -1,0 +1,13 @@
+disallowed-types = [
+  { path = "std::boxed::Box", reason = "Use concrete ownership or a reviewed item-scoped exception." },
+  { path = "std::sync::Arc", reason = "Use concrete ownership or a reviewed item-scoped exception." },
+  { path = "std::rc::Rc", reason = "Use concrete ownership or a reviewed item-scoped exception." },
+  { path = "std::sync::Mutex", reason = "Pass owned state through explicit transitions." },
+  { path = "std::sync::RwLock", reason = "Pass owned state through explicit transitions." },
+  { path = "std::cell::RefCell", reason = "Use exclusive borrowing." },
+  { path = "std::cell::Cell", reason = "Use exclusive borrowing." },
+]
+disallowed-methods = [
+  { path = "std::mem::forget", reason = "Resources must be released through ownership." },
+  { path = "std::boxed::Box::leak", reason = "Resources must not leak." },
+]

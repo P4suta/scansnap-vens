@@ -1,0 +1,40 @@
+[workspace]
+members = ["crates/vens-core"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+unfulfilled_lint_expectations = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+disallowed_types = "deny"
+disallowed_methods = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+dbg_macro = "deny"
+exit = "deny"
+expect_used = "deny"
+get_unwrap = "deny"
+indexing_slicing = "deny"
+mem_forget = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+string_slice = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+wildcard_enum_match_arm = "deny"
