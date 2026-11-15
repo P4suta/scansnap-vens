@@ -1,0 +1,11 @@
+[package]
+name = "lint-fixtures"
+version = "0.0.0"
+description = "Sources that the workspace lint table must accept or refuse"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

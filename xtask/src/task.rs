@@ -55,6 +55,8 @@ const NATIVE: &[Step] = &[
             "clippy",
             "--locked",
             "--workspace",
+            "--exclude",
+            LINT_FIXTURE_PACKAGE,
             "--all-targets",
             "--",
             "-D",
@@ -63,8 +65,59 @@ const NATIVE: &[Step] = &[
     },
     Step {
         program: "cargo",
-        arguments: &["test", "--locked", "--workspace"],
+        arguments: &[
+            "test",
+            "--locked",
+            "--workspace",
+            "--exclude",
+            LINT_FIXTURE_PACKAGE,
+        ],
     },
+];
+
+const LINT_FIXTURE_PACKAGE: &str = "lint-fixtures";
+
+macro_rules! lint_fixture {
+    ($name:literal, $expectation:expr) => {
+        Fixture {
+            name: $name,
+            expectation: $expectation,
+            step: Step {
+                program: "cargo",
+                arguments: &[
+                    "clippy",
+                    "--locked",
+                    "--package",
+                    LINT_FIXTURE_PACKAGE,
+                    "--bin",
+                    $name,
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+            },
+        }
+    };
+}
+
+pub(crate) const LINT_FIXTURES: &[Fixture] = &[
+    lint_fixture!("accepted", Expectation::Accepted),
+    lint_fixture!("unwrap", rejected("index.html#unwrap_used")),
+    lint_fixture!("expect", rejected("index.html#expect_used")),
+    lint_fixture!("explicit_panic", rejected("index.html#panic")),
+    lint_fixture!("indexing", rejected("index.html#indexing_slicing")),
+    lint_fixture!("lossy_cast", rejected("index.html#as_conversions")),
+    lint_fixture!(
+        "unchecked_arithmetic",
+        rejected("index.html#arithmetic_side_effects")
+    ),
+    lint_fixture!(
+        "wildcard_match",
+        rejected("index.html#wildcard_enum_match_arm")
+    ),
+    lint_fixture!("allow_attribute", rejected("index.html#allow_attributes")),
+    lint_fixture!("boxed", rejected("index.html#disallowed_types")),
+    lint_fixture!("unsafe_block", rejected("usage of an `unsafe` block")),
 ];
 
 const STATIC_TYPES_MARKER: &str = "error: static_types:";
@@ -122,6 +175,8 @@ const WORKSPACE_STATIC_TYPES: &[Step] = &[Step {
         "--fail-on-no-libraries",
         "--",
         "--workspace",
+        "--exclude",
+        LINT_FIXTURE_PACKAGE,
         "--all-targets",
     ],
 }];
@@ -144,6 +199,7 @@ impl Task {
         match self {
             Self::Check => &[
                 Stage::Run(NATIVE),
+                Stage::Judge(LINT_FIXTURES),
                 Stage::Judge(STATIC_TYPE_FIXTURES),
                 Stage::Run(WORKSPACE_STATIC_TYPES),
             ],
@@ -218,8 +274,10 @@ mod tests {
     use std::{fs, io, path::Path};
 
     use super::{
-        Runner, STATIC_TYPE_FIXTURES, Step, StepError, Task, TaskError, UsageError, execute,
+        LINT_FIXTURES, Runner, STATIC_TYPE_FIXTURES, Step, StepError, Task, TaskError, UsageError,
+        execute,
     };
+    use crate::fixture::Fixture;
     use crate::fixture::{Expectation, FixtureError, Observation};
 
     fn arguments(values: &[&str]) -> impl Iterator<Item = String> {
@@ -275,6 +333,7 @@ mod tests {
             self.observed.push(step);
             let expectation = STATIC_TYPE_FIXTURES
                 .iter()
+                .chain(LINT_FIXTURES)
                 .find(|fixture| fixture.step == step)
                 .map(|fixture| fixture.expectation);
             Ok(match (self.lint, expectation) {
@@ -291,9 +350,11 @@ mod tests {
         }
     }
 
-    fn fixture_sources() -> io::Result<Vec<String>> {
-        let directory =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../verification/type-fixtures/src/bin");
+    fn fixture_sources(package: &str) -> io::Result<Vec<String>> {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../verification")
+            .join(package)
+            .join("src/bin");
         let mut names = Vec::new();
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
@@ -318,14 +379,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_fixture_source_has_a_stated_expectation() {
-        let mut stated: Vec<String> = STATIC_TYPE_FIXTURES
+    fn stated(fixtures: &[Fixture]) -> Vec<String> {
+        let mut names: Vec<String> = fixtures
             .iter()
             .map(|fixture| fixture.name.to_owned())
             .collect();
-        stated.sort();
-        assert_eq!(fixture_sources().ok(), Some(stated));
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn every_fixture_source_has_a_stated_expectation() {
+        assert_eq!(
+            fixture_sources("type-fixtures").ok(),
+            Some(stated(STATIC_TYPE_FIXTURES))
+        );
+        assert_eq!(
+            fixture_sources("lint-fixtures").ok(),
+            Some(stated(LINT_FIXTURES))
+        );
+    }
+
+    #[test]
+    fn check_judges_the_lint_fixtures_after_the_native_steps() {
+        let mut recorder = Recorder::new(Lint::AcceptsEverything, None);
+        assert_eq!(
+            execute(Task::Check, &mut recorder),
+            Err(TaskError::Fixture(FixtureError::Accepted {
+                name: "unwrap"
+            }))
+        );
+        assert_eq!(
+            recorder.subcommands(),
+            [Some("fmt"), Some("clippy"), Some("test")]
+        );
     }
 
     #[test]
@@ -377,7 +464,12 @@ mod tests {
             recorder.subcommands(),
             [Some("fmt"), Some("clippy"), Some("test"), Some("dylint")]
         );
-        assert_eq!(recorder.observed.len(), STATIC_TYPE_FIXTURES.len());
+        assert_eq!(
+            recorder.observed.len(),
+            STATIC_TYPE_FIXTURES
+                .len()
+                .saturating_add(LINT_FIXTURES.len())
+        );
     }
 
     #[test]

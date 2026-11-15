@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vens-core", "xtask"]
+members = ["crates/vens-core", "verification/lint-fixtures", "xtask"]
 exclude = ["verification/static-types", "verification/type-fixtures"]
 resolver = "3"
 
