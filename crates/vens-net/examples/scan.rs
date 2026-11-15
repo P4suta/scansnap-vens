@@ -1,5 +1,6 @@
 //! Scans every sheet in the top chute once and writes one image file for each side.
 //! Usage: `scan <output-directory> [scanner-address]`.
+//! Load one sheet: the scanner feeds the whole stack, and this command sends no keepalive for a long job.
 
 use std::{
     env, fmt, fs,
@@ -40,7 +41,8 @@ enum Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage => formatter.write_str("usage: scan <output-directory> [scanner-address]"),
+            Self::Usage => formatter
+                .write_str("usage: scan <output-directory> [scanner-address]; load one sheet only"),
             Self::Address(text) => write!(formatter, "`{text}` is not an IPv4 address"),
             Self::Io(error) => write!(formatter, "input or output failure: {error}"),
             Self::Clock => formatter.write_str("the system clock is outside the supported range"),

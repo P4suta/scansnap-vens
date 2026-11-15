@@ -13,7 +13,7 @@ use crate::{
     scan::{Clock, PageSink, ScanError, run},
 };
 
-const STATUS_CAPACITY: usize = 0x30;
+const STATUS_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Host {

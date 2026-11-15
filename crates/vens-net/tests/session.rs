@@ -218,6 +218,17 @@ fn a_session_reserves_with_the_registered_identifier_and_releases_after_the_job(
 }
 
 #[test]
+fn a_status_reply_with_a_few_extra_bytes_still_yields_the_identifier() {
+    let mut long_status = status([0xFF; 8]);
+    long_status.extend_from_slice(&[0, 0]);
+    let command = [greeting(), frame(GOOD, &long_status)];
+    assert_eq!(
+        session(&command, &[greeting()]).map(|(outcome, _, _)| outcome),
+        Some(Err(SessionError::NotRegistered))
+    );
+}
+
+#[test]
 fn a_scanner_without_a_registered_identifier_is_never_reserved() {
     let command = [greeting(), frame(GOOD, &status([0xFF; 8]))];
     assert_eq!(
