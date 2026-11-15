@@ -14,15 +14,14 @@ Other public sources have no license or a copyleft license.
 
 ## Decision
 
-Use only facts that trace to a hardware-verified section of those documents or to this project's own capture.
+Use only facts that trace to a hardware-verified section of those documents, a published standard, or this project's own capture.
 Copy no code and no prose from any source.
 Keep the unlicensed and copyleft implementations out of the implementation work.
 Name the source section in the test that fixes each frame layout.
 
 ## Alternatives
 
-Porting an existing implementation is faster.
-It would import license terms and assumptions that nobody tested on this model.
+Porting an existing implementation would import license terms and assumptions that nobody tested on this model.
 
 ## Consequences
 
