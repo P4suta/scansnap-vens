@@ -1,4 +1,12 @@
-use crate::{command::Cdb, wire::put};
+use crate::{
+    Ipv4Address, MacAddress,
+    command::{Cdb, Request},
+    wire::put,
+};
+
+const PRE_READ_DATA_OUT: u16 = 32;
+const PARAMETERS_DATA_OUT: u16 = 80;
+const START_JOB_DATA_OUT: u16 = 8;
 
 const CANCEL_READ: u8 = 0xD8;
 const PRE_READ: u8 = 0xE9;
@@ -298,6 +306,19 @@ impl Command {
     #[must_use]
     pub const fn data_in(&self) -> u32 {
         self.data_in
+    }
+
+    #[must_use]
+    pub const fn request(&self, mac: MacAddress, host: Ipv4Address) -> Request {
+        let data_out = match &self.payload {
+            Payload::Empty => 0,
+            Payload::PreRead(_) => PRE_READ_DATA_OUT,
+            Payload::Parameters(_) => PARAMETERS_DATA_OUT,
+            Payload::StartJob(_) => START_JOB_DATA_OUT,
+        };
+        Request::new(mac, host, self.cdb)
+            .expecting(self.data_in)
+            .sending(data_out)
     }
 
     #[must_use]

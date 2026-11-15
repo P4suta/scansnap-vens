@@ -1,10 +1,60 @@
 //! Commands follow sections 8.1 to 8.4 of the ix1300-wifi protocol document, all marked as verified on hardware.
 //! The settings are the tested ones: 300 dpi, automatic color, both sides, top chute.
 
-use vens_core::scan::{Command, Sequence, SheetIndex, Side};
+use vens_core::{
+    Ipv4Address, MacAddress,
+    command::Request,
+    scan::{Command, Sequence, SheetIndex, Side},
+};
+
+const HOST: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
+const HOST_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 0x01]);
 
 fn parts(command: &Command) -> (&[u8], u32, &[u8]) {
     (command.cdb().bytes(), command.data_in(), command.payload())
+}
+
+#[test]
+fn a_command_frames_itself_with_its_data_lengths() {
+    let parameters = Command::scan_parameters();
+    assert_eq!(
+        parameters.request(HOST_MAC, HOST),
+        Request::new(HOST_MAC, HOST, *parameters.cdb()).sending(0x50)
+    );
+    let status = Command::hardware_status();
+    assert_eq!(
+        status.request(HOST_MAC, HOST),
+        Request::new(HOST_MAC, HOST, *status.cdb()).expecting(0x30)
+    );
+    let start = Command::start_job();
+    assert_eq!(
+        start.request(HOST_MAC, HOST),
+        Request::new(HOST_MAC, HOST, *start.cdb())
+            .sending(8)
+            .expecting(8)
+    );
+}
+
+#[test]
+fn the_declared_data_out_length_equals_the_payload_length() {
+    let commands = [
+        Command::cancel_read(),
+        Command::pre_read(),
+        Command::scan_parameters(),
+        Command::hardware_status(),
+        Command::start_job(),
+        Command::next_sheet(),
+        Command::end_job(),
+        Command::request_sense(),
+    ];
+    for command in commands {
+        let frame = command.request(HOST_MAC, HOST).encode();
+        let declared = frame
+            .get(40..44)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_be_bytes);
+        assert_eq!(declared, u32::try_from(command.payload().len()).ok());
+    }
 }
 
 #[test]
