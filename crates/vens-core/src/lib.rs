@@ -5,6 +5,7 @@ pub mod control;
 pub mod discovery;
 mod identity;
 pub mod scan;
+pub mod sense;
 pub mod status;
 mod wire;
 
