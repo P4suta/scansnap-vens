@@ -1,13 +1,15 @@
 //! Scans every sheet in the top chute once and writes one image file for each side.
-//! Usage: `scan <output-directory> [scanner-address]`.
+//! Usage: `scan <output-directory> [scanner-address [trace-file]]`.
 //! Load one sheet: the scanner feeds the whole stack, and this command sends no keepalive for a long job.
+//! A trace file receives every frame of the run with its identifiers and image bytes, so keep it out of version control.
 
 use std::{
     env, fmt, fs,
     io::{self, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
+    sync::mpsc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,8 +18,10 @@ use vens_net::{
     channel::{ChannelError, CommandChannel},
     control::{ControlChannel, ControlError},
     host::{DirectorySink, SinkError, SleepingClock, TcpPort, UdpPort, local_address_toward},
+    record::Recorder,
     search::{SearchError, search},
     session::{Host, SessionError, scan_once},
+    trace::{self, Channel, Event},
 };
 
 const DISCOVERY_PORT: u16 = 52217;
@@ -36,13 +40,15 @@ enum Failure {
     Command(ChannelError<io::Error>),
     Control(ControlError<io::Error>),
     Session(SessionError<io::Error, SinkError>),
+    Trace(io::Error),
 }
 
 impl fmt::Display for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage => formatter
-                .write_str("usage: scan <output-directory> [scanner-address]; load one sheet only"),
+            Self::Usage => formatter.write_str(
+                "usage: scan <output-directory> [scanner-address [trace-file]]; load one sheet only",
+            ),
             Self::Address(text) => write!(formatter, "`{text}` is not an IPv4 address"),
             Self::Io(error) => write!(formatter, "input or output failure: {error}"),
             Self::Clock => formatter.write_str("the system clock is outside the supported range"),
@@ -55,17 +61,29 @@ impl fmt::Display for Failure {
             Self::Command(error) => write!(formatter, "command channel failure: {error:?}"),
             Self::Control(error) => write!(formatter, "control channel failure: {error:?}"),
             Self::Session(error) => write!(formatter, "scan session failure: {error:?}"),
+            Self::Trace(error) => write!(formatter, "trace file failure: {error}"),
         }
     }
 }
 
-fn arguments() -> Result<(PathBuf, Ipv4Addr), Failure> {
+struct Arguments {
+    directory: PathBuf,
+    target: Ipv4Addr,
+    trace: Option<PathBuf>,
+}
+
+fn arguments() -> Result<Arguments, Failure> {
     let mut arguments = env::args().skip(1);
     let directory = arguments.next().map(PathBuf::from).ok_or(Failure::Usage)?;
     let target = arguments.next().map_or(Ok(Ipv4Addr::BROADCAST), |text| {
         text.parse().map_err(|_| Failure::Address(text))
     })?;
-    Ok((directory, target))
+    let trace = arguments.next().map(PathBuf::from);
+    Ok(Arguments {
+        directory,
+        target,
+        trace,
+    })
 }
 
 fn now() -> Result<LocalTime, Failure> {
@@ -85,9 +103,13 @@ fn trigger_port(socket: &UdpSocket) -> Result<Port, Failure> {
     }
 }
 
-fn run(out: &mut impl Write) -> Result<(), Failure> {
-    let (directory, target) = arguments()?;
-    fs::create_dir_all(&directory).map_err(Failure::Io)?;
+fn scan(
+    arguments: &Arguments,
+    events: &mpsc::Sender<Event>,
+    out: &mut impl Write,
+) -> Result<(), Failure> {
+    fs::create_dir_all(&arguments.directory).map_err(Failure::Io)?;
+    let target = arguments.target;
     let route = if target.is_broadcast() {
         ROUTE_PROBE
     } else {
@@ -95,7 +117,8 @@ fn run(out: &mut impl Write) -> Result<(), Failure> {
     };
     let local = local_address_toward(route).map_err(Failure::Io)?;
     let address = Ipv4Address::new(local.octets());
-    let mut discovery = UdpPort::open(PROBE_INTERVAL).map_err(Failure::Io)?;
+    let port = UdpPort::open(PROBE_INTERVAL).map_err(Failure::Io)?;
+    let mut discovery = Recorder::new(port, Channel::Discovery, events.clone());
     let scanner = search(
         &mut discovery,
         Probe::search(address, HOST_MAC),
@@ -115,12 +138,16 @@ fn run(out: &mut impl Write) -> Result<(), Failure> {
     let mut command = TcpPort::connect(command_port, COMMAND_DEADLINE)
         .map_err(Failure::Io)
         .and_then(|stream| {
+            let stream = Recorder::new(stream, Channel::Command, events.clone());
             CommandChannel::open(stream, HOST_MAC, address).map_err(Failure::Command)
         })?;
     let mut control = TcpPort::connect(control_port, COMMAND_DEADLINE)
         .map_err(Failure::Io)
-        .and_then(|stream| ControlChannel::open(stream).map_err(Failure::Control))?;
-    let mut sink = DirectorySink::new(directory);
+        .and_then(|stream| {
+            let stream = Recorder::new(stream, Channel::Control, events.clone());
+            ControlChannel::open(stream).map_err(Failure::Control)
+        })?;
+    let mut sink = DirectorySink::new(arguments.directory.clone());
     let mut buffer = vec![0_u8; REPLY_CAPACITY];
     let summary = scan_once(
         &mut command,
@@ -138,12 +165,34 @@ fn run(out: &mut impl Write) -> Result<(), Failure> {
         .map_err(Failure::Io)
 }
 
+fn save_trace(path: &Path, log: &mpsc::Receiver<Event>) -> Result<(), Failure> {
+    let events: Vec<Event> = log.try_iter().collect();
+    fs::write(path, trace::render(&events)).map_err(Failure::Trace)
+}
+
+fn run(out: &mut impl Write) -> Vec<Failure> {
+    let arguments = match arguments() {
+        Ok(arguments) => arguments,
+        Err(failure) => return Vec::from([failure]),
+    };
+    let (events, log) = mpsc::channel();
+    let scanned = scan(&arguments, &events, out).err();
+    let saved = arguments
+        .trace
+        .as_deref()
+        .and_then(|path| save_trace(path, &log).err());
+    scanned.into_iter().chain(saved).collect()
+}
+
 fn main() -> ExitCode {
-    match run(&mut io::stdout().lock()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(failure) => {
-            let _ = writeln!(io::stderr().lock(), "scan failed: {failure}");
-            ExitCode::FAILURE
-        }
+    let failures = run(&mut io::stdout().lock());
+    let mut errors = io::stderr().lock();
+    for failure in &failures {
+        let _ = writeln!(errors, "scan failed: {failure}");
+    }
+    if failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

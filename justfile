@@ -15,5 +15,5 @@ fmt:
 hardware-probe *target:
     cargo run --locked -p vens-net --example probe -- {{ target }}
 
-hardware-scan directory *target:
-    cargo run --locked -p vens-net --example scan -- {{ quote(directory) }} {{ target }}
+hardware-scan directory *address_and_trace:
+    cargo run --locked -p vens-net --example scan -- {{ quote(directory) }} {{ address_and_trace }}
