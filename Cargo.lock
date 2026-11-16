@@ -9,6 +9,11 @@ version = "0.0.0"
 [[package]]
 name = "vens-cli"
 version = "0.0.0"
+dependencies = [
+ "vens-core",
+ "vens-emulator",
+ "vens-net",
+]
 
 [[package]]
 name = "vens-core"

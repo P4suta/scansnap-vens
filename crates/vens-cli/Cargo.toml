@@ -12,3 +12,10 @@ path = "src/main.rs"
 
 [lints]
 workspace = true
+
+[dependencies]
+vens-core.workspace = true
+vens-net.workspace = true
+
+[dev-dependencies]
+vens-emulator.workspace = true
