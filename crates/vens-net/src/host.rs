@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fmt, fs,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
     path::PathBuf,
@@ -65,6 +65,15 @@ impl Clock for SleepingClock {
 pub enum SinkError {
     Io(io::Error),
     Image(JpegError),
+}
+
+impl fmt::Display for SinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(formatter),
+            Self::Image(error) => write!(formatter, "the image header is malformed ({error:?})"),
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, net::SocketAddrV4};
+use std::{collections::VecDeque, fmt, net::SocketAddrV4};
 
 use vens_net::{
     channel::Stream,
@@ -26,6 +26,31 @@ pub enum ReplayError {
         expected: usize,
         actual: usize,
     },
+}
+
+impl fmt::Display for ReplayError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Diverged {
+                offset,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "byte {offset} differs from the recording: {actual:#04x} instead of {expected:#04x}"
+            ),
+            Self::OutOfOrder { offset } => write!(
+                formatter,
+                "the transfer at byte {offset} leaves the recorded order"
+            ),
+            Self::Exhausted => formatter.write_str("the recording has ended"),
+            Self::UnknownEndpoint => formatter.write_str("the recording has no such endpoint"),
+            Self::DatagramLength { expected, actual } => write!(
+                formatter,
+                "a datagram of {actual} bytes differs from the recorded {expected} bytes"
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
