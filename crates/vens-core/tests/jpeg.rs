@@ -1,9 +1,10 @@
 //! The correction follows section 8.4 of the ix1300-wifi protocol document.
 //! The marker segments and the frame header follow annex B of ITU-T T.81.
 
-use vens_core::jpeg::{JpegError, set_height};
+use vens_core::jpeg::{FrameSize, JpegError, frame_size, set_height};
 
 const HEIGHT_OFFSET: usize = 18;
+const WIDTH_END: usize = 22;
 
 fn image(frame_marker: u8) -> [u8; 34] {
     [
@@ -97,6 +98,39 @@ fn a_segment_without_a_marker_prefix_is_refused_with_its_position() {
         set_height(&mut bytes, 9856),
         Err(JpegError::InvalidSegment { offset: 8 })
     );
+}
+
+#[test]
+fn the_frame_size_comes_from_the_frame_header() {
+    for frame_marker in [0xC0, 0xC2] {
+        assert_eq!(
+            frame_size(&image(frame_marker)),
+            Ok(FrameSize {
+                width: 2592,
+                height: 10576
+            })
+        );
+    }
+}
+
+#[test]
+fn the_frame_size_of_an_image_without_a_frame_header_is_refused() {
+    assert_eq!(
+        frame_size(&replaced(image(0xC0), 14, &[0xDA])),
+        Err(JpegError::NoFrameHeader)
+    );
+    assert_eq!(frame_size(&[]), Err(JpegError::NotJpeg));
+}
+
+#[test]
+fn the_frame_size_of_an_image_cut_before_the_width_is_refused_at_every_length() {
+    let bytes = image(0xC0);
+    for length in 2..WIDTH_END {
+        assert_eq!(
+            frame_size(bytes.get(..length).unwrap_or_default()),
+            Err(JpegError::Truncated)
+        );
+    }
 }
 
 #[test]
