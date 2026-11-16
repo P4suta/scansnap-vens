@@ -13,14 +13,15 @@ use vens_core::{
     status::PaperPath,
 };
 use vens_net::{
-    channel::ChannelError, control::ControlError, network::Connection, scan::ScanError,
+    channel::ChannelError,
+    control::ControlError,
+    network::Connection,
+    operation::{Failure, Scanned, State},
+    scan::ScanError,
     session::SessionError,
 };
 
-use crate::{
-    invocation::UsageError,
-    operation::{Failure, Scanned, State},
-};
+use crate::invocation::UsageError;
 
 const USAGE: &str = "usage: vens <subcommand> [options]
 

@@ -2,5 +2,4 @@
 
 pub mod command;
 pub mod invocation;
-pub mod operation;
 pub mod report;

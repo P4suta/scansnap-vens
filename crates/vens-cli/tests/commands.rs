@@ -12,11 +12,11 @@ use std::{
 use vens_cli::{
     command::{Exit, Output, run, scan_output},
     invocation::Invocation,
-    operation::{ScanRun, Scanned},
 };
 use vens_emulator::network::{Contact, FixtureNetwork};
 use vens_net::{
     network::Connection,
+    operation::{ScanRun, Scanned},
     trace::{self, Channel, Direction, Event},
 };
 

@@ -4,14 +4,7 @@ use std::{
     num::NonZeroU8,
 };
 
-use vens_core::{
-    Ipv4Address, MacAddress,
-    command::ScsiStatus,
-    discovery::{Probe, SearchReply},
-    scan::Command,
-    status::{HardwareStatus, StatusError},
-};
-use vens_net::{
+use crate::{
     channel::{ChannelError, CommandChannel},
     control::{ControlChannel, ControlError},
     keepalive::DatagramKeepalive,
@@ -19,6 +12,13 @@ use vens_net::{
     scan::{Clock, PageSink},
     search::{SearchError, search},
     session::{Host, SessionError, scan_once},
+};
+use vens_core::{
+    Ipv4Address, MacAddress,
+    command::ScsiStatus,
+    discovery::{Probe, SearchReply},
+    scan::Command,
+    status::{HardwareStatus, StatusError},
 };
 
 /// Identifies this host in every frame.

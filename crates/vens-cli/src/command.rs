@@ -12,12 +12,12 @@ use vens_core::control::LocalTime;
 use vens_net::{
     host::{DirectorySink, SinkError},
     network::{Network, RecordingNetwork},
+    operation::{self, ScanRun},
     trace::Event,
 };
 
 use crate::{
     invocation::{Invocation, UsageError},
-    operation::{self, ScanRun},
     report,
 };
 
