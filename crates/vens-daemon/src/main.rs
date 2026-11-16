@@ -1,5 +1,6 @@
 use std::{
     env,
+    hash::{BuildHasher, RandomState},
     io::{self, Write},
     net::{Ipv4Addr, Ipv6Addr, TcpListener},
     process::ExitCode,
@@ -22,7 +23,8 @@ const LIMITS: Limits = Limits {
     head: 16_384,
     body: 65_536,
 };
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Gives each request this long to arrive in full; eSCL requests are a few kilobytes at most.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Leaves room for a page of several megabytes over a slow wireless link.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const USAGE_FAILURE: u8 = 2;
@@ -35,6 +37,17 @@ impl Networks for System {
     fn network(&mut self) -> Option<SystemNetwork> {
         Some(SystemNetwork::new(PROBE_INTERVAL, DEADLINE))
     }
+}
+
+/// Draws the job identifier seed from the randomly keyed hasher that the standard library seeds from the system.
+fn seed() -> [u8; 16] {
+    let keys = RandomState::new();
+    let [high, low] = [0_u8, 1].map(|input| keys.hash_one(input).to_be_bytes());
+    let mut seed = [0; 16];
+    for (slot, byte) in seed.iter_mut().zip(high.into_iter().chain(low)) {
+        *slot = byte;
+    }
+    seed
 }
 
 fn since_epoch() -> Duration {
@@ -88,10 +101,10 @@ fn serve(port: u16, target: Ipv4Addr, uuid: Uuid) -> ExitCode {
     ));
     let config = Config {
         uuid,
-        seed: since_epoch().as_nanos().to_be_bytes(),
+        seed: seed(),
         target,
         limits: LIMITS,
-        read_timeout: READ_TIMEOUT,
+        request_timeout: REQUEST_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
     };
     server::serve(&listener, System, config, log);

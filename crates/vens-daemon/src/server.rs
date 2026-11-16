@@ -1,5 +1,6 @@
 use std::{
     fmt::Debug,
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, Scope},
@@ -35,7 +36,8 @@ pub struct Config {
     /// The scanner's address, or the broadcast address to search for it.
     pub target: Ipv4Addr,
     pub limits: Limits,
-    pub read_timeout: Duration,
+    /// The time that a whole request may take to arrive.
+    pub request_timeout: Duration,
     pub write_timeout: Duration,
 }
 
@@ -79,14 +81,44 @@ fn line(events: &Sender<Event>, text: String) {
     let _ = events.send(Event::Line(text));
 }
 
+/// A connection whose reads share one deadline, so a client can't stretch a request by trickling its bytes.
+struct Deadline<'a> {
+    stream: &'a mut TcpStream,
+    started: Instant,
+    limit: Duration,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for Deadline<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Sender<Event>) {
-    let timeouts = stream
-        .set_read_timeout(Some(config.read_timeout))
-        .and_then(|()| stream.set_write_timeout(Some(config.write_timeout)));
-    if let Err(error) = timeouts {
+    if let Err(error) = stream.set_write_timeout(Some(config.write_timeout)) {
         return line(events, format!("{peer} timeouts failed: {error}"));
     }
-    let request = match read_request(&mut stream, config.limits) {
+    let mut deadline = Deadline {
+        stream: &mut stream,
+        started: Instant::now(),
+        limit: config.request_timeout,
+    };
+    let request = match read_request(&mut deadline, config.limits) {
         Ok(request) => request,
         Err(error) => {
             let text = match refusal(error) {

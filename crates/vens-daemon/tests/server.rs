@@ -7,7 +7,7 @@ use std::{
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use vens_core::jpeg::frame_size;
@@ -34,7 +34,7 @@ const CONFIG: Config = Config {
         head: 8192,
         body: 65536,
     },
-    read_timeout: Duration::from_millis(300),
+    request_timeout: Duration::from_millis(300),
     write_timeout: Duration::from_secs(5),
 };
 
@@ -258,6 +258,35 @@ fn a_silent_connection_times_out_while_other_clients_get_answers() {
         Some((answered, rest))
     });
     assert_eq!(checks, Some((200, Vec::new())));
+}
+
+#[test]
+fn a_client_that_trickles_its_request_is_cut_off_at_the_request_deadline() {
+    let checks = start(Vec::new()).and_then(|(port, _log)| {
+        let mut reader = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).ok()?;
+        reader
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .ok()?;
+        let mut writer = reader.try_clone().ok()?;
+        let started = Instant::now();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                for byte in b"GET /eSCL/ScannerCapabilities HTTP/1.1\r\n\r\n" {
+                    if writer.write_all(&[*byte]).is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            });
+            let mut answer = Vec::new();
+            let closed = reader.read_to_end(&mut answer).is_ok();
+            Some((
+                closed && answer.is_empty(),
+                started.elapsed() < Duration::from_secs(2),
+            ))
+        })
+    });
+    assert_eq!(checks, Some((true, true)));
 }
 
 /// Reads log lines until one matches, and returns every line read.
