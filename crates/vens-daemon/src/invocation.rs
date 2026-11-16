@@ -9,6 +9,21 @@ pub const DEFAULT_UUID: Uuid = Uuid::from_bytes([
 ]);
 const AVAHI_SERVICE: &str = "avahi-service";
 
+pub const USAGE: &str = "usage: vensd [--port <port>] [--address <ipv4>] [--uuid <uuid>]
+       vensd avahi-service [--port <port>] [--uuid <uuid>]
+
+  vensd
+      serve eSCL clients and run each job on the scanner
+  vensd avahi-service
+      print an Avahi service file that advertises the bridge
+
+options:
+  --port <port>      listen on this TCP port (default 8090)
+  --address <ipv4>   reach the scanner at this address instead of a broadcast search
+  --uuid <uuid>      identify the bridge with this UUID (default 9ff23966-94ee-48d8-9284-1e1e09ff7271)
+  --help             show this help
+";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invocation {
     Serve {

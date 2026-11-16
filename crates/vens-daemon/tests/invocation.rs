@@ -2,7 +2,7 @@
 
 use std::{ffi::OsString, net::Ipv4Addr};
 
-use vens_daemon::invocation::{DEFAULT_PORT, DEFAULT_UUID, Invocation, UsageError, parse};
+use vens_daemon::invocation::{DEFAULT_PORT, DEFAULT_UUID, Invocation, USAGE, UsageError, parse};
 use vens_escl::uuid::Uuid;
 
 const ID: &str = "6f1c2e8a-3b4d-4c5e-9f60-7a8b9c0d1e2f";
@@ -98,6 +98,19 @@ fn an_argument_that_isnt_unicode_is_refused() {
     assert_eq!(
         parse([OsString::from_vec([0x66, 0x80].to_vec())]),
         Err(UsageError::NotUnicode)
+    );
+}
+
+#[test]
+fn the_usage_names_both_forms_and_the_defaults() {
+    assert_eq!(
+        [
+            USAGE.starts_with("usage: vensd [--port <port>]"),
+            USAGE.contains("vensd avahi-service"),
+            USAGE.contains(&format!("default {DEFAULT_PORT}")),
+            USAGE.contains(&format!("default {DEFAULT_UUID}")),
+        ],
+        [true; 4]
     );
 }
 
