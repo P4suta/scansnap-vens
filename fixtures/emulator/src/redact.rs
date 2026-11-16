@@ -5,7 +5,10 @@
 
 use std::iter;
 
-use vens_core::jpeg::{FrameSize, frame_size};
+use vens_core::{
+    discovery::KeepaliveReply,
+    jpeg::{FrameSize, frame_size},
+};
 use vens_net::trace::{Channel, Direction, Event};
 
 pub const HOST_ADDRESS: [u8; 4] = [192, 0, 2, 12];
@@ -26,6 +29,7 @@ const PROBE_LENGTH: usize = 32;
 const PROBE_HOST: usize = 8;
 const PROBE_MAC: usize = 12;
 const SEARCH_REPLY_LENGTH: usize = 144;
+const KEEPALIVE_REPLY_LENGTH: usize = 12;
 const SEARCH_SCANNER_ADDRESS: usize = 16;
 const SEARCH_SCANNER_MAC: usize = 28;
 const SEARCH_DEVICE_NAME: usize = 40;
@@ -258,6 +262,8 @@ impl Redaction {
                         .push(swap(frame, SEARCH_LAST_OWNER_ID, &HOST_ID)?);
                 }
             }
+            (Direction::Received, KEEPALIVE_REPLY_LENGTH)
+                if KeepaliveReply::decode(frame).is_ok() => {}
             _ => return None,
         }
         Some(())

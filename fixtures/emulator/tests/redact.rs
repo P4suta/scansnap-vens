@@ -682,6 +682,83 @@ fn a_space_padded_serial_is_searched_without_its_padding() {
     );
 }
 
+fn keepalive_reply(marker: [u8; 2]) -> Vec<u8> {
+    let mut reply = b"VENS".to_vec();
+    reply.extend_from_slice(&marker);
+    reply.resize(12, 0);
+    reply
+}
+
+fn with_keepalive(events: &mut Vec<Event>, after: usize, reply: &[u8]) {
+    let probe = Probe::keepalive(
+        Ipv4Address::new(PRIVATE_HOST),
+        MacAddress::new(PRIVATE_HOST_MAC),
+    )
+    .encode();
+    let exchange = [
+        event(Channel::Discovery, Direction::Sent, &probe),
+        event(Channel::Discovery, Direction::Received, reply),
+        event(Channel::Discovery, Direction::Received, reply),
+        event(Channel::Discovery, Direction::Received, reply),
+    ];
+    for (offset, keepalive) in exchange.into_iter().enumerate() {
+        events.insert(after.saturating_add(offset), keepalive);
+    }
+}
+
+#[test]
+fn a_keepalive_probe_gets_documentation_values_and_its_replies_stay() {
+    let passes = one_front();
+    let reply = keepalive_reply([0x80, 0x01]);
+    let outcome = refused(&plain(&passes), |events, layout| {
+        with_keepalive(events, layout.reserve.saturating_add(2), &reply);
+    });
+    let expected_probe =
+        Probe::keepalive(Ipv4Address::new(HOST_ADDRESS), MacAddress::new(HOST_MAC))
+            .encode()
+            .to_vec();
+    assert_eq!(
+        outcome.and_then(|(result, _)| result.ok()).map(|events| {
+            bytes_of(&events, Channel::Discovery, Direction::Sent)
+                .into_iter()
+                .chain(
+                    bytes_of(&events, Channel::Discovery, Direction::Received)
+                        .into_iter()
+                        .skip(1),
+                )
+                .collect::<Vec<_>>()
+        }),
+        Some(
+            [
+                Probe::search(Ipv4Address::new(HOST_ADDRESS), MacAddress::new(HOST_MAC))
+                    .encode()
+                    .to_vec(),
+                expected_probe,
+                reply.clone(),
+                reply.clone(),
+                reply,
+            ]
+            .to_vec()
+        )
+    );
+}
+
+#[test]
+fn a_short_discovery_datagram_without_the_keepalive_marker_is_refused() {
+    let passes = one_front();
+    let outcome = refused(&plain(&passes), |events, layout| {
+        with_keepalive(
+            events,
+            layout.reserve.saturating_add(2),
+            &keepalive_reply([0x12, 0x34]),
+        );
+    });
+    assert_eq!(
+        outcome.map(|(result, layout)| (result.err(), layout.reserve)),
+        Some((Some(RedactError::UnexpectedEvent { index: 10 }), 7))
+    );
+}
+
 #[test]
 fn a_side_without_a_frame_header_is_refused() {
     let passes = [Pass {
