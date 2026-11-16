@@ -2,3 +2,4 @@
 
 pub mod redact;
 pub mod replay;
+pub mod session;
