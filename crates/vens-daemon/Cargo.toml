@@ -11,4 +11,5 @@ workspace = true
 
 [dependencies]
 httparse.workspace = true
+roxmltree.workspace = true
 vens-escl.workspace = true
