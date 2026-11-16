@@ -35,6 +35,10 @@ name = "vens-core"
 version = "0.0.0"
 
 [[package]]
+name = "vens-daemon"
+version = "0.0.0"
+
+[[package]]
 name = "vens-emulator"
 version = "0.0.0"
 dependencies = [

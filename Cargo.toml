@@ -2,6 +2,7 @@
 members = [
   "crates/vens-cli",
   "crates/vens-core",
+  "crates/vens-daemon",
   "crates/vens-escl",
   "crates/vens-net",
   "fixtures/emulator",
