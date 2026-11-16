@@ -18,7 +18,7 @@ use vens_net::{
     network::Connection,
     operation::{Failure, Scanned, State},
     scan::ScanError,
-    session::SessionError,
+    session::{JobFailure, PrepareError, SessionError},
 };
 
 use crate::invocation::UsageError;
@@ -295,30 +295,36 @@ fn scan<E: Display, K: Display>(error: &ScanError<E, K>) -> String {
     }
 }
 
-fn session<E: Display, K: Display>(error: &SessionError<E, K>) -> String {
+fn prepare<E: Display>(error: &PrepareError<E>) -> String {
     match error {
-        SessionError::Command(error) => command(error),
-        SessionError::StatusRefused(status) => {
+        PrepareError::Command(error) => command(error),
+        PrepareError::StatusRefused(status) => {
             format!("the scanner refused the status request ({})", scsi(*status))
         }
-        SessionError::Status(_) => "a status reply is malformed".to_owned(),
-        SessionError::NotRegistered => {
+        PrepareError::Status(_) => "a status reply is malformed".to_owned(),
+        PrepareError::NotRegistered => {
             "the scanner has no registered host; pair it once with ScanSnap Home".to_owned()
         }
+    }
+}
+
+fn session<E: Display, K: Display>(error: &SessionError<E, K>) -> String {
+    match error {
+        SessionError::Prepare(error) => prepare(error),
         SessionError::Reserve(error) => control(error),
-        SessionError::Scan {
+        SessionError::Job(JobFailure::Scan {
             failure,
             release: Ok(()),
-        } => scan(failure),
-        SessionError::Scan {
+        }) => scan(failure),
+        SessionError::Job(JobFailure::Scan {
             failure,
             release: Err(error),
-        } => format!(
+        }) => format!(
             "{}; the release failed too: {}",
             scan(failure),
             control(error)
         ),
-        SessionError::Release { summary, failure } => format!(
+        SessionError::Job(JobFailure::Release { summary, failure }) => format!(
             "{} scanned, but {}",
             sheets(summary.sheets),
             control(failure)

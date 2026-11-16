@@ -19,7 +19,7 @@ use vens_emulator::{
 use vens_net::{
     channel::ChannelError,
     search::{DOCUMENTED_ATTEMPTS, search},
-    session::SessionError,
+    session::{PrepareError, SessionError},
     trace::{self, Channel, Direction, Event},
 };
 
@@ -142,12 +142,12 @@ fn the_session_keeps_the_recorded_order_across_both_connections() {
 fn a_request_that_differs_by_one_byte_is_refused() {
     assert_eq!(
         replay_session(&events(), [192, 0, 2, 13]).map(|replayed| replayed.outcome),
-        Some(Err(SessionError::Command(ChannelError::Port(
-            ReplayError::Diverged {
+        Some(Err(SessionError::Prepare(PrepareError::Command(
+            ChannelError::Port(ReplayError::Diverged {
                 offset: 27,
                 expected: 12,
                 actual: 13
-            }
+            })
         ))))
     );
 }

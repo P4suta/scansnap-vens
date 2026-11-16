@@ -10,13 +10,14 @@ use vens_core::{
     keepalive::Elapsed,
     scan::Side,
     sense::Condition,
+    status::PaperPath,
 };
 use vens_net::{
     channel::{CommandChannel, Stream},
     control::{ControlChannel, ControlError},
     keepalive::Keepalive,
     scan::{Clock, PageSink, ScanError},
-    session::{Host, SessionError, scan_once},
+    session::{Host, JobFailure, PrepareError, SessionError, prepare, reserve, scan_once},
 };
 
 const ADDRESS: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
@@ -129,6 +130,14 @@ fn status(host_id: [u8; 8]) -> Vec<u8> {
     data
 }
 
+fn empty_chute_status() -> Vec<u8> {
+    let mut data = status(HOST_ID);
+    if let Some(chute) = data.get_mut(3) {
+        *chute = 0x80;
+    }
+    data
+}
+
 fn sense([flags_and_key, code, qualifier]: [u8; 3]) -> Vec<u8> {
     let mut data = vec![0_u8; 18];
     for (offset, value) in [(2, flags_and_key), (12, code), (13, qualifier)] {
@@ -236,6 +245,84 @@ fn session(command: &[Vec<u8>], control: &[Vec<u8>]) -> Option<(Outcome, Vec<u8>
 }
 
 #[test]
+fn prepare_reads_the_registered_identifier_and_the_paper_position() {
+    let replies = [greeting(), frame(GOOD, &status(HOST_ID))];
+    let prepared = CommandChannel::open(Wire::new(&replies), MAC, ADDRESS)
+        .ok()
+        .map(|mut command| prepare(&mut command));
+    assert_eq!(
+        prepared.map(|prepared| prepared.map(|prepared| (prepared.host_id(), prepared.paper()))),
+        Some(Ok((HostId::new(HOST_ID), PaperPath::TopChute)))
+    );
+}
+
+#[test]
+fn prepare_reports_an_empty_chute_with_the_identifier() {
+    let replies = [greeting(), frame(GOOD, &empty_chute_status())];
+    let prepared = CommandChannel::open(Wire::new(&replies), MAC, ADDRESS)
+        .ok()
+        .map(|mut command| prepare(&mut command));
+    assert_eq!(
+        prepared.map(|prepared| prepared.map(|prepared| (prepared.host_id(), prepared.paper()))),
+        Some(Ok((HostId::new(HOST_ID), PaperPath::Absent)))
+    );
+}
+
+#[test]
+fn a_reserve_sends_the_reserve_and_holds_the_scanner_without_a_release() {
+    let replies = [greeting(), frame(GOOD, &status(HOST_ID))];
+    let mut command = CommandChannel::open(Wire::new(&replies), MAC, ADDRESS).ok();
+    let mut control = ControlChannel::open(Wire::new(&[greeting(), control_reply(20, 0)])).ok();
+    let reserved = match (command.as_mut().map(prepare), control.as_mut(), host()) {
+        (Some(Ok(prepared)), Some(control), Some(host)) => reserve(control, host, prepared).ok(),
+        _ => None,
+    };
+    assert_eq!(
+        (
+            reserved.is_some(),
+            control.map(|control| control.into_stream().outgoing)
+        ),
+        (true, expected_reserve())
+    );
+}
+
+#[test]
+fn the_steps_reserve_scan_and_release_like_one_session() {
+    let replies = one_sheet();
+    let control_replies = [greeting(), control_reply(20, 0), control_reply(16, 0)];
+    let mut command = CommandChannel::open(Wire::new(&replies), MAC, ADDRESS).ok();
+    let mut control = ControlChannel::open(Wire::new(&control_replies)).ok();
+    let mut sink = Finished::default();
+    let mut buffer = [0_u8; 64];
+    let outcome = match (command.as_mut(), control.as_mut(), host()) {
+        (Some(command), Some(control), Some(host)) => prepare(command)
+            .ok()
+            .and_then(|prepared| reserve(control, host, prepared).ok())
+            .map(|reserved| {
+                reserved.scan(
+                    command,
+                    control,
+                    &mut Ticks::default(),
+                    &mut Instant,
+                    &mut sink,
+                    &mut buffer,
+                )
+            }),
+        _ => None,
+    };
+    let sent = expected_reserve()
+        .map(|reserve| [reserve.as_slice(), Release::new(MAC).encode().as_slice()].concat());
+    assert_eq!(
+        (
+            outcome,
+            control.map(|control| control.into_stream().outgoing),
+            sink.0.len()
+        ),
+        (Some(Ok(Summary { sheets: 1 })), sent, 2)
+    );
+}
+
+#[test]
 fn the_session_ticks_the_keepalive_before_every_job_command() {
     let control = [greeting(), control_reply(20, 0), control_reply(16, 0)];
     assert_eq!(
@@ -262,7 +349,7 @@ fn a_status_reply_with_a_few_extra_bytes_still_yields_the_identifier() {
     let command = [greeting(), frame(GOOD, &long_status)];
     assert_eq!(
         session(&command, &[greeting()]).map(|(outcome, _, _)| outcome),
-        Some(Err(SessionError::NotRegistered))
+        Some(Err(SessionError::Prepare(PrepareError::NotRegistered)))
     );
 }
 
@@ -271,7 +358,11 @@ fn a_scanner_without_a_registered_identifier_is_never_reserved() {
     let command = [greeting(), frame(GOOD, &status([0xFF; 8]))];
     assert_eq!(
         session(&command, &[greeting()]),
-        Some((Err(SessionError::NotRegistered), Vec::new(), 0))
+        Some((
+            Err(SessionError::Prepare(PrepareError::NotRegistered)),
+            Vec::new(),
+            0
+        ))
     );
 }
 
@@ -305,10 +396,10 @@ fn a_failed_job_still_releases_the_scanner_and_reports_the_job_failure() {
     assert_eq!(
         session(&jammed_job(), &control).map(|(outcome, sent, _)| (outcome, sent)),
         sent.map(|sent| (
-            Err(SessionError::Scan {
+            Err(SessionError::Job(JobFailure::Scan {
                 failure: ScanError::Job(JobError::Condition(Condition::PaperJam)),
                 release: Ok(()),
-            }),
+            })),
             sent
         ))
     );
@@ -319,10 +410,10 @@ fn a_failed_job_with_a_refused_release_reports_both_failures() {
     let control = [greeting(), control_reply(20, 0), control_reply(16, -1)];
     assert_eq!(
         session(&jammed_job(), &control).map(|(outcome, _, _)| outcome),
-        Some(Err(SessionError::Scan {
+        Some(Err(SessionError::Job(JobFailure::Scan {
             failure: ScanError::Job(JobError::Condition(Condition::PaperJam)),
             release: Err(ControlError::Release(-1)),
-        }))
+        })))
     );
 }
 
@@ -332,10 +423,10 @@ fn a_refused_release_after_a_good_job_keeps_the_job_summary() {
     assert_eq!(
         session(&one_sheet(), &control).map(|(outcome, _, sides)| (outcome, sides)),
         Some((
-            Err(SessionError::Release {
+            Err(SessionError::Job(JobFailure::Release {
                 summary: Summary { sheets: 1 },
                 failure: ControlError::Release(-1),
-            }),
+            })),
             2
         ))
     );
