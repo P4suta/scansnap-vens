@@ -4,13 +4,14 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use vens_core::{Ipv4Address, Port, control::LocalTime};
 use vens_emulator::{
-    network::FixtureNetwork,
+    network::{Contact, FixtureNetwork},
     redact::{HOST_ADDRESS, SCANNER_ADDRESS, TRIGGER_PORT},
     replay::ReplayError,
 };
 use vens_net::{
     channel::Stream,
     network::{Connection, Network},
+    search::Datagram,
     trace,
 };
 
@@ -89,4 +90,41 @@ fn the_host_facilities_carry_the_documentation_values() {
 #[test]
 fn a_fixture_without_a_search_reply_gives_no_network() {
     assert!(FixtureNetwork::new(Vec::new()).is_none());
+}
+
+#[test]
+fn an_observed_network_reports_every_datagram_target_and_connection_in_order() {
+    let observed = trace::parse(FIXTURE)
+        .ok()
+        .and_then(FixtureNetwork::observed)
+        .map(|(mut network, contacts)| {
+            let probe_target = SocketAddrV4::new(Ipv4Addr::BROADCAST, 52217);
+            let sent = network
+                .open_discovery()
+                .and_then(|mut discovery| discovery.send(&[0x56], probe_target));
+            let refused = network.connect(endpoint(53220), Connection::Command).err();
+            let accepted = network
+                .connect(endpoint(53218), Connection::Command)
+                .is_ok();
+            (
+                sent.is_err(),
+                refused,
+                accepted,
+                contacts.try_iter().collect::<Vec<_>>(),
+            )
+        });
+    assert_eq!(
+        observed,
+        Some((
+            true,
+            Some(ReplayError::UnknownEndpoint),
+            true,
+            [
+                Contact::Datagram(SocketAddrV4::new(Ipv4Addr::BROADCAST, 52217)),
+                Contact::Connect(endpoint(53220), Connection::Command),
+                Contact::Connect(endpoint(53218), Connection::Command),
+            ]
+            .to_vec()
+        ))
+    );
 }

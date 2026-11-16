@@ -1,8 +1,12 @@
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::{
+    net::{Ipv4Addr, SocketAddrV4},
+    sync::mpsc,
+};
 
 use vens_core::{Ipv4Address, Port, control::LocalTime, discovery::SearchReply};
 use vens_net::{
     network::{Connection, Network},
+    search::Datagram,
     trace::{Channel, Direction, Event},
 };
 
@@ -11,6 +15,46 @@ use crate::{
     replay::{DatagramReplay, Replay, ReplayError},
     session::Pauses,
 };
+
+/// Names a place that a command reached through the fixture network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Contact {
+    Datagram(SocketAddrV4),
+    Connect(SocketAddrV4, Connection),
+}
+
+/// Plays the recorded discovery datagrams back and reports the target of each one that the host sends.
+#[derive(Debug)]
+pub struct ObservedDatagram {
+    replay: DatagramReplay,
+    contacts: Option<mpsc::Sender<Contact>>,
+}
+
+impl ObservedDatagram {
+    #[must_use]
+    pub fn finished(&self) -> bool {
+        self.replay.finished()
+    }
+}
+
+fn report(contacts: Option<&mpsc::Sender<Contact>>, contact: Contact) {
+    if let Some(contacts) = contacts {
+        let _ = contacts.send(contact);
+    }
+}
+
+impl Datagram for ObservedDatagram {
+    type Error = ReplayError;
+
+    fn send(&mut self, frame: &[u8], target: SocketAddrV4) -> Result<(), ReplayError> {
+        report(self.contacts.as_ref(), Contact::Datagram(target));
+        self.replay.send(frame, target)
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>, ReplayError> {
+        self.replay.receive(buffer)
+    }
+}
 
 /// Offers a recorded scanner through the network port.
 ///
@@ -22,6 +66,7 @@ pub struct FixtureNetwork {
     command: SocketAddrV4,
     control: SocketAddrV4,
     time: LocalTime,
+    contacts: Option<mpsc::Sender<Contact>>,
 }
 
 impl FixtureNetwork {
@@ -40,14 +85,29 @@ impl FixtureNetwork {
             control: SocketAddrV4::new(address, reply.control_port().number()),
             time: LocalTime::new(2026, 1, 1, 0, 0, 0)?,
             events,
+            contacts: None,
         })
+    }
+
+    /// Builds the network together with a receiver of every datagram target and connection that a command reaches.
+    #[must_use]
+    pub fn observed(events: Vec<Event>) -> Option<(Self, mpsc::Receiver<Contact>)> {
+        let (contacts, log) = mpsc::channel();
+        let network = Self::new(events)?;
+        Some((
+            Self {
+                contacts: Some(contacts),
+                ..network
+            },
+            log,
+        ))
     }
 }
 
 impl Network for FixtureNetwork {
     type Error = ReplayError;
-    type Discovery = DatagramReplay;
-    type Keepalive = DatagramReplay;
+    type Discovery = ObservedDatagram;
+    type Keepalive = ObservedDatagram;
     type Stream = Replay;
     type Trigger = ();
     type Clock = Pauses;
@@ -56,11 +116,14 @@ impl Network for FixtureNetwork {
         Ok(Ipv4Address::new(HOST_ADDRESS))
     }
 
-    fn open_discovery(&mut self) -> Result<DatagramReplay, ReplayError> {
-        Ok(DatagramReplay::new(&self.events))
+    fn open_discovery(&mut self) -> Result<ObservedDatagram, ReplayError> {
+        Ok(ObservedDatagram {
+            replay: DatagramReplay::new(&self.events),
+            contacts: self.contacts.clone(),
+        })
     }
 
-    fn keepalive(&mut self, discovery: DatagramReplay) -> Result<DatagramReplay, ReplayError> {
+    fn keepalive(&mut self, discovery: ObservedDatagram) -> Result<ObservedDatagram, ReplayError> {
         Ok(discovery)
     }
 
@@ -73,6 +136,10 @@ impl Network for FixtureNetwork {
         endpoint: SocketAddrV4,
         connection: Connection,
     ) -> Result<Replay, ReplayError> {
+        report(
+            self.contacts.as_ref(),
+            Contact::Connect(endpoint, connection),
+        );
         match connection {
             Connection::Command if endpoint == self.command => {
                 Ok(Replay::new(&self.events, Channel::Command))
