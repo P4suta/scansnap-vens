@@ -10,4 +10,5 @@ publish = false
 workspace = true
 
 [dependencies]
+vens-core.workspace = true
 vens-net.workspace = true
