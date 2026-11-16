@@ -12,6 +12,9 @@ check:
 fmt:
     cargo fmt --all
 
+redact-capture raw fixture:
+    cargo run --locked -p xtask -- redact-capture {{ quote(raw) }} {{ quote(fixture) }}
+
 hardware-probe *target:
     cargo run --locked -p vens-net --example probe -- {{ target }}
 

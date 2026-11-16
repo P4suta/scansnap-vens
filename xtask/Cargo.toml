@@ -8,3 +8,7 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+vens-emulator.workspace = true
+vens-net.workspace = true

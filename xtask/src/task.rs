@@ -29,6 +29,7 @@ pub(crate) struct Step {
 pub(crate) enum UsageError {
     Missing,
     Unknown(String),
+    MissingArgument(&'static str),
     Trailing(String),
 }
 
@@ -81,7 +82,8 @@ const NATIVE: &[Step] = &[
     },
 ];
 
-const TASK_NAMES: &str = "check, static-types, or dependencies";
+const TASK_NAMES: &str =
+    "check, static-types, dependencies, or redact-capture <raw-trace> <fixture>";
 const LINT_FIXTURE_PACKAGE: &str = "lint-fixtures";
 
 macro_rules! lint_fixture {
@@ -260,6 +262,7 @@ impl fmt::Display for UsageError {
             Self::Unknown(name) => {
                 write!(formatter, "unknown task: {name}; expected {TASK_NAMES}")
             }
+            Self::MissingArgument(name) => write!(formatter, "expected the {name} path"),
             Self::Trailing(extra) => write!(formatter, "unexpected argument: {extra}"),
         }
     }
