@@ -21,7 +21,7 @@ use vens_net::{
     keepalive::DatagramKeepalive,
     record::Recorder,
     scan::Clock,
-    search::{SearchError, search},
+    search::{DOCUMENTED_ATTEMPTS, SearchError, search},
     session::{Host, SessionError, scan_once},
     trace::{self, Channel, Event},
 };
@@ -125,6 +125,7 @@ fn scan(
         &mut discovery,
         Probe::search(address, HOST_MAC),
         SocketAddrV4::new(target, DISCOVERY_PORT),
+        DOCUMENTED_ATTEMPTS,
     )
     .map_err(Failure::Search)?;
     let scanner_address = Ipv4Addr::from(scanner.address().octets());

@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     net::{Ipv4Addr, SocketAddrV4},
+    num::NonZeroU8,
 };
 
 use vens_core::{
@@ -25,6 +26,8 @@ use vens_net::{
 pub const HOST_MAC: MacAddress = MacAddress::new([0x02, 0x76, 0x65, 0x6E, 0x73, 0x01]);
 
 const DISCOVERY_PORT: u16 = 52217;
+/// Gives a scanner in power save about ten seconds of half-second probe windows to wake up.
+const SEARCH_ATTEMPTS: NonZeroU8 = NonZeroU8::MIN.saturating_add(19);
 const STATUS_CAPACITY: usize = 64;
 const REPLY_CAPACITY: usize = 0x0030_0040;
 
@@ -71,6 +74,7 @@ fn find<N: Network, K>(
         &mut discovery,
         Probe::search(local, HOST_MAC),
         SocketAddrV4::new(target, DISCOVERY_PORT),
+        SEARCH_ATTEMPTS,
     )
     .map_err(Failure::Search)?;
     Ok(Found {

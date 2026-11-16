@@ -12,6 +12,9 @@ check:
 fmt:
     cargo fmt --all
 
+vens *arguments:
+    cargo run --locked -p vens-cli -- {{ arguments }}
+
 redact-capture raw fixture:
     cargo run --locked -p xtask -- redact-capture {{ quote(raw) }} {{ quote(fixture) }}
 

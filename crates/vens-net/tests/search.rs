@@ -1,12 +1,14 @@
 //! The retry rule follows section 5.1 of the ix1300-wifi protocol document: send each probe three times.
+//! A caller may allow more attempts for a scanner that sleeps in power save.
 
 use std::{
     collections::VecDeque,
     net::{Ipv4Addr, SocketAddrV4},
+    num::NonZeroU8,
 };
 
 use vens_core::{Ipv4Address, MacAddress, discovery::Probe};
-use vens_net::search::{Datagram, SearchError, search};
+use vens_net::search::{DOCUMENTED_ATTEMPTS, Datagram, SearchError, search};
 
 const TARGET: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::BROADCAST, 52217);
 const HOST: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
@@ -78,7 +80,7 @@ fn probe() -> Probe {
 #[test]
 fn the_first_valid_reply_ends_the_search() {
     let mut port = Script::new([Some(reply())]);
-    let found = search(&mut port, probe(), TARGET);
+    let found = search(&mut port, probe(), TARGET, DOCUMENTED_ATTEMPTS);
     assert_eq!(
         found.map(|reply| reply.address()),
         Ok(Ipv4Address::new([192, 0, 2, 20]))
@@ -90,23 +92,34 @@ fn the_first_valid_reply_ends_the_search() {
 fn a_silent_scanner_gets_three_probes_before_the_search_gives_up() {
     let mut port = Script::new([]);
     assert_eq!(
-        search(&mut port, probe(), TARGET).err(),
+        search(&mut port, probe(), TARGET, DOCUMENTED_ATTEMPTS).err(),
         Some(SearchError::NoReply { attempts: 3 })
     );
     assert_eq!(port.sent.len(), 3);
 }
 
 #[test]
+fn a_patient_search_sends_as_many_probes_as_it_allows() {
+    let mut port = Script::new([]);
+    let attempts = NonZeroU8::MIN.saturating_add(19);
+    assert_eq!(
+        search(&mut port, probe(), TARGET, attempts).err(),
+        Some(SearchError::NoReply { attempts: 20 })
+    );
+    assert_eq!(port.sent.len(), 20);
+}
+
+#[test]
 fn a_reply_to_a_later_probe_is_accepted() {
     let mut port = Script::new([None, Some(reply())]);
-    assert!(search(&mut port, probe(), TARGET).is_ok());
+    assert!(search(&mut port, probe(), TARGET, DOCUMENTED_ATTEMPTS).is_ok());
     assert_eq!(port.sent.len(), 2);
 }
 
 #[test]
 fn a_datagram_that_is_not_a_search_reply_is_skipped() {
     let mut port = Script::new([Some(b"noise".to_vec()), Some(reply())]);
-    assert!(search(&mut port, probe(), TARGET).is_ok());
+    assert!(search(&mut port, probe(), TARGET, DOCUMENTED_ATTEMPTS).is_ok());
     assert_eq!(port.sent.len(), 1);
 }
 
@@ -115,7 +128,7 @@ fn a_port_failure_ends_the_search_with_its_cause() {
     let mut port = Script::new([]);
     port.unplugged = true;
     assert_eq!(
-        search(&mut port, probe(), TARGET).err(),
+        search(&mut port, probe(), TARGET, DOCUMENTED_ATTEMPTS).err(),
         Some(SearchError::Port(Unplugged))
     );
 }

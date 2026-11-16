@@ -19,7 +19,7 @@ use vens_core::{
 use vens_net::{
     channel::{ChannelError, CommandChannel},
     host::{TcpPort, UdpPort, local_address_toward},
-    search::{SearchError, search},
+    search::{DOCUMENTED_ATTEMPTS, SearchError, search},
 };
 
 const DISCOVERY_PORT: u16 = 52217;
@@ -139,6 +139,7 @@ fn run(out: &mut impl Write) -> Result<(), Failure> {
         &mut port,
         Probe::search(host, PROBE_MAC),
         SocketAddrV4::new(target, DISCOVERY_PORT),
+        DOCUMENTED_ATTEMPTS,
     )
     .map_err(Failure::Search)?;
     let scanner = SocketAddrV4::new(

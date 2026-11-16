@@ -18,7 +18,7 @@ use vens_emulator::{
 };
 use vens_net::{
     channel::ChannelError,
-    search::search,
+    search::{DOCUMENTED_ATTEMPTS, search},
     session::SessionError,
     trace::{self, Channel, Direction, Event},
 };
@@ -84,6 +84,7 @@ fn discovery_replays_with_documentation_identifiers() {
         &mut discovery,
         Probe::search(Ipv4Address::new(HOST_ADDRESS), MacAddress::new(HOST_MAC)),
         target,
+        DOCUMENTED_ATTEMPTS,
     );
     assert_eq!(
         reply.map(|reply| (
