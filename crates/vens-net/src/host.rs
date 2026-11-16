@@ -1,5 +1,6 @@
 use std::{
-    fmt, fs,
+    fmt,
+    fs::OpenOptions,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
     path::PathBuf,
@@ -63,14 +64,14 @@ impl Clock for SleepingClock {
 
 #[derive(Debug)]
 pub enum SinkError {
-    Io(io::Error),
+    Io { path: PathBuf, error: io::Error },
     Image(JpegError),
 }
 
 impl fmt::Display for SinkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => error.fmt(formatter),
+            Self::Io { path, error } => write!(formatter, "{}: {error}", path.display()),
             Self::Image(error) => write!(formatter, "the image header is malformed ({error:?})"),
         }
     }
@@ -116,7 +117,14 @@ impl PageSink for DirectorySink {
         };
         let number = sheet.saturating_add(1);
         let path = self.directory.join(format!("sheet-{number:03}-{side}.jpg"));
-        fs::write(&path, &image).map_err(SinkError::Io)?;
+        let written = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(&image));
+        if let Err(error) = written {
+            return Err(SinkError::Io { path, error });
+        }
         self.written.push(path);
         Ok(())
     }
@@ -205,6 +213,7 @@ impl Stream for TcpPort {
 /// Fails when no route to `target` exists or the selected address isn't IPv4.
 pub fn local_address_toward(target: Ipv4Addr) -> io::Result<Ipv4Addr> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, ANY_PORT))?;
+    socket.set_broadcast(true)?;
     socket.connect((target, DISCARD_PORT))?;
     match socket.local_addr()? {
         SocketAddr::V4(address) => Ok(*address.ip()),

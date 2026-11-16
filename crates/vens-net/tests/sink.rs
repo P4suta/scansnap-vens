@@ -79,9 +79,50 @@ fn refused(name: &str) -> io::Result<(Option<JpegError>, usize)> {
         .and_then(|()| sink.finish(0, Side::Front, 9856));
     let reason = match outcome {
         Err(SinkError::Image(error)) => Some(error),
-        Ok(()) | Err(SinkError::Io(_)) => None,
+        Ok(()) | Err(SinkError::Io { .. }) => None,
     };
     Ok((reason, fs::read_dir(&scratch.0)?.count()))
+}
+
+struct Kept {
+    failure: Option<(PathBuf, io::ErrorKind)>,
+    content: Vec<u8>,
+    message: String,
+}
+
+fn kept(name: &str) -> io::Result<Kept> {
+    let scratch = Scratch::create(name)?;
+    let existing = scratch.0.join("sheet-001-front.jpg");
+    fs::write(&existing, b"an earlier scan")?;
+    let mut sink = DirectorySink::new(scratch.0.clone());
+    let outcome = sink
+        .append(0, Side::Front, &IMAGE)
+        .and_then(|()| sink.finish(0, Side::Front, 9856));
+    let message = outcome
+        .as_ref()
+        .err()
+        .map_or_else(String::new, ToString::to_string);
+    let failure = match outcome {
+        Err(SinkError::Io { path, error }) => Some((path, error.kind())),
+        Ok(()) | Err(SinkError::Image(_)) => None,
+    };
+    Ok(Kept {
+        failure,
+        content: fs::read(&existing)?,
+        message,
+    })
+}
+
+#[test]
+fn an_existing_image_is_never_overwritten_and_the_failure_names_its_path() {
+    let outcome = kept("existing");
+    assert!(outcome.is_ok_and(|kept| {
+        kept.failure.as_ref().is_some_and(|(path, kind)| {
+            path.ends_with("sheet-001-front.jpg")
+                && *kind == io::ErrorKind::AlreadyExists
+                && kept.message.contains(&path.display().to_string())
+        }) && kept.content == b"an earlier scan"
+    }));
 }
 
 #[test]
