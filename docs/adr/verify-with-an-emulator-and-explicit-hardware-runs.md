@@ -15,7 +15,7 @@ A check that needs paper in a feeder can't gate every commit.
 
 Build an in-process emulator that replays redacted hardware traces.
 Run every gate test on the emulator with a virtual clock.
-Run hardware checks only through the explicit `just hardware-scan` command.
+Run hardware checks only through an explicit `vens` command, such as `just vens scan`.
 Hooks and hosted workflows never run them.
 Redact host identifiers, addresses, serial numbers, and image payloads before a trace enters the repository.
 
