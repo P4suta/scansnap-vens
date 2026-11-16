@@ -7,6 +7,10 @@ name = "lint-fixtures"
 version = "0.0.0"
 
 [[package]]
+name = "vens-cli"
+version = "0.0.0"
+
+[[package]]
 name = "vens-core"
 version = "0.0.0"
 

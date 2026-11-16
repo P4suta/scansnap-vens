@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/vens-cli",
   "crates/vens-core",
   "crates/vens-net",
   "fixtures/emulator",
