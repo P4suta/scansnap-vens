@@ -53,10 +53,15 @@ pub trait Log {
     fn record(&mut self, line: &str);
 }
 
+/// The client, media type, and body of a job request, which the log keeps beside the answer.
+struct JobRequest {
+    client: String,
+    body: String,
+}
+
 struct Responder {
     line: String,
-    /// The client and body of a job request, which the log shows when the bridge refuses it.
-    detail: Option<String>,
+    job: Option<JobRequest>,
     reply: Sender<Response<Vec<u8>>>,
 }
 
@@ -136,16 +141,16 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
     };
     let (reply, answers) = mpsc::channel();
     let escl = escl_request(&request);
-    let detail = matches!(escl, Request::CreateJob(_) | Request::Malformed).then(|| {
-        let body: String = String::from_utf8_lossy(&request.body)
-            .chars()
-            .take(BODY_EXCERPT)
-            .collect();
-        format!(
-            "client {:?}, type {:?}, body {body:?}",
+    let job = matches!(escl, Request::CreateJob(_) | Request::Malformed).then(|| JobRequest {
+        client: format!(
+            "client {:?}, type {:?}",
             request.user_agent.as_deref().unwrap_or("unnamed"),
             request.content_type.as_deref().unwrap_or("none")
-        )
+        ),
+        body: String::from_utf8_lossy(&request.body)
+            .chars()
+            .take(BODY_EXCERPT)
+            .collect(),
     });
     let responder = Responder {
         line: format!(
@@ -153,7 +158,7 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
             request.method.escape_debug(),
             request.target.escape_debug()
         ),
-        detail,
+        job,
         reply,
     };
     if events
@@ -291,9 +296,17 @@ fn own<'scope, S: Networks, L: Log>(
                     response,
                 } => {
                     let (code, _) = status(&response);
-                    log.record(&format!("{} {code}{}", responder.line, reason(&response)));
-                    if let (400..=599, Some(detail)) = (code, &responder.detail) {
-                        log.record(&format!("{} {detail}", responder.line));
+                    let client = responder
+                        .job
+                        .as_ref()
+                        .map_or_else(String::new, |job| format!(" {}", job.client));
+                    log.record(&format!(
+                        "{} {code}{}{client}",
+                        responder.line,
+                        reason(&response)
+                    ));
+                    if let (400..=599, Some(job)) = (code, &responder.job) {
+                        log.record(&format!("{} body {:?}", responder.line, job.body));
                     }
                     let _ = responder.reply.send(response);
                 }

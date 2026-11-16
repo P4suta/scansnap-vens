@@ -364,14 +364,28 @@ fn a_refused_job_request_logs_its_reason_client_and_body() {
     });
     assert_eq!(
         lines.map(|lines| (
+            lines.iter().any(|line| line.ends_with(
+                "POST /eSCL/ScanJobs 409 Unsupported(ColorMode) client \"AirScanScanner/58\", type \"none\""
+            )),
             lines
                 .iter()
-                .any(|line| line.ends_with("POST /eSCL/ScanJobs 409 Unsupported(ColorMode)")),
-            lines
-                .iter()
-                .any(|line| line.contains("AirScanScanner/58") && line.contains("Grayscale8")),
+                .any(|line| line.contains("POST /eSCL/ScanJobs body") && line.contains("Grayscale8")),
         )),
         Some((true, true))
+    );
+}
+
+#[test]
+fn an_accepted_job_request_logs_its_client_and_media_type() {
+    let line = start([events(ONE_SHEET)].to_vec()).and_then(|(port, log)| {
+        post(port, "/eSCL/ScanJobs", SETTINGS)?;
+        lines_until(&log, |line| line.contains("POST /eSCL/ScanJobs 201")).pop()
+    });
+    assert_eq!(
+        line.map(
+            |line| line.ends_with("POST /eSCL/ScanJobs 201 client \"unnamed\", type \"text/xml\"")
+        ),
+        Some(true)
     );
 }
 

@@ -65,7 +65,8 @@ fn scan_settings(request: &HttpRequest) -> Result<Result<JobSettings, Unsupporte
 
 /// Names the bridge request for a read HTTP request, with the settings of a job request.
 ///
-/// A job request with a media type that a browser form sends is malformed, so a web page can't start a scan.
+/// A job request with a media type that a browser form sends is malformed, which stops a plain form on a web page.
+/// A page script can still send a body without a media type, which an allow-list of XML types would stop once Image Capture's type is known.
 #[must_use]
 pub fn escl_request(request: &HttpRequest) -> Request {
     match route(&request.method, &request.target) {
