@@ -22,6 +22,7 @@ httparse = "1.10.1"
 roxmltree = "0.21.2"
 vens-core = { path = "crates/vens-core", version = "0.0.0" }
 vens-emulator = { path = "fixtures/emulator", version = "0.0.0" }
+vens-escl = { path = "crates/vens-escl", version = "0.0.0" }
 vens-net = { path = "crates/vens-net", version = "0.0.0" }
 
 [workspace.lints.rust]

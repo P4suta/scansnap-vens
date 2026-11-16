@@ -45,6 +45,7 @@ name = "vens-daemon"
 version = "0.0.0"
 dependencies = [
  "httparse",
+ "vens-escl",
 ]
 
 [[package]]

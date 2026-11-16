@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 
 use httparse::{EMPTY_HEADER, Status};
+use vens_escl::bridge::Response;
 
 use crate::framing::{Framing, FramingError, framing};
 
@@ -234,4 +235,146 @@ pub fn read_request<S: Read + Write>(
         target: head.target,
         body,
     })
+}
+
+/// The answer to a request that the reader couldn't read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    BadRequest,
+    HeadTooLarge,
+    BodyTooLarge,
+    NotImplemented,
+}
+
+/// Picks the answer to a failed read, or none when the connection itself failed or closed.
+#[must_use]
+pub const fn refusal(error: ReadError) -> Option<Refusal> {
+    match error {
+        ReadError::Io(_) | ReadError::Closed => None,
+        ReadError::Malformed
+        | ReadError::Framing(
+            FramingError::Conflicting | FramingError::InvalidLength | FramingError::Unframed,
+        ) => Some(Refusal::BadRequest),
+        ReadError::HeadTooLarge => Some(Refusal::HeadTooLarge),
+        ReadError::BodyTooLarge => Some(Refusal::BodyTooLarge),
+        ReadError::Framing(FramingError::UnsupportedCoding) => Some(Refusal::NotImplemented),
+    }
+}
+
+enum Field {
+    ContentType(&'static str),
+    Location(String),
+    Allow(&'static str),
+}
+
+enum Body<'a> {
+    Empty,
+    Text(String),
+    Bytes(&'a [u8]),
+}
+
+struct Message<'a> {
+    status: (u16, &'static str),
+    field: Option<Field>,
+    body: Body<'a>,
+}
+
+/// Names the status code and reason phrase of an eSCL response.
+#[must_use]
+pub const fn status<P>(response: &Response<P>) -> (u16, &'static str) {
+    match response {
+        Response::Capabilities(_) | Response::Status(_) | Response::Page(_) | Response::Deleted => {
+            (200, "OK")
+        }
+        Response::Created(_) => (201, "Created"),
+        Response::NotFound => (404, "Not Found"),
+        Response::MethodNotAllowed(_) => (405, "Method Not Allowed"),
+        Response::BadRequest => (400, "Bad Request"),
+        Response::Conflict(_) => (409, "Conflict"),
+        Response::Unavailable(_) => (503, "Service Unavailable"),
+    }
+}
+
+/// Names the status code and reason phrase of a refusal.
+#[must_use]
+pub const fn refusal_status(refusal: Refusal) -> (u16, &'static str) {
+    match refusal {
+        Refusal::BadRequest => (400, "Bad Request"),
+        Refusal::HeadTooLarge => (431, "Request Header Fields Too Large"),
+        Refusal::BodyTooLarge => (413, "Content Too Large"),
+        Refusal::NotImplemented => (501, "Not Implemented"),
+    }
+}
+
+fn message(response: &Response<Vec<u8>>) -> Message<'_> {
+    let (field, body) = match response {
+        Response::Capabilities(document) => (
+            Some(Field::ContentType("text/xml")),
+            Body::Text(document.to_string()),
+        ),
+        Response::Status(document) => (
+            Some(Field::ContentType("text/xml")),
+            Body::Text(document.to_string()),
+        ),
+        Response::Page(bytes) => (Some(Field::ContentType("image/jpeg")), Body::Bytes(bytes)),
+        Response::Created(path) => (Some(Field::Location(path.to_string())), Body::Empty),
+        Response::MethodNotAllowed(method) => (Some(Field::Allow(method.token())), Body::Empty),
+        Response::Deleted
+        | Response::NotFound
+        | Response::BadRequest
+        | Response::Conflict(_)
+        | Response::Unavailable(_) => (None, Body::Empty),
+    };
+    Message {
+        status: status(response),
+        field,
+        body,
+    }
+}
+
+fn write_message<W: Write>(writer: &mut W, message: &Message<'_>) -> io::Result<()> {
+    let body = match &message.body {
+        Body::Empty => &[][..],
+        Body::Text(text) => text.as_bytes(),
+        Body::Bytes(bytes) => bytes,
+    };
+    let field = match &message.field {
+        Some(Field::ContentType(media)) => format!("Content-Type: {media}\r\n"),
+        Some(Field::Location(path)) => format!("Location: {path}\r\n"),
+        Some(Field::Allow(method)) => format!("Allow: {method}\r\n"),
+        None => String::new(),
+    };
+    let (code, reason) = message.status;
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\n{field}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    writer.write_all(head.as_bytes())?;
+    writer.write_all(body)?;
+    writer.flush()
+}
+
+/// Writes an eSCL response with its length, and says that the connection closes after it.
+///
+/// # Errors
+///
+/// Reports a failed write.
+pub fn write_response<W: Write>(writer: &mut W, response: &Response<Vec<u8>>) -> io::Result<()> {
+    write_message(writer, &message(response))
+}
+
+/// Writes the refusal of an unreadable request.
+///
+/// # Errors
+///
+/// Reports a failed write.
+pub fn write_refusal<W: Write>(writer: &mut W, refusal: Refusal) -> io::Result<()> {
+    write_message(
+        writer,
+        &Message {
+            status: refusal_status(refusal),
+            field: None,
+            body: Body::Empty,
+        },
+    )
 }
