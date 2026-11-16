@@ -309,7 +309,7 @@ fn a_refused_job_request_logs_its_reason_client_and_body() {
         exchange(
             port,
             format!(
-                "POST /eSCL/ScanJobs HTTP/1.1\r\nUser-Agent: AirScanScanner/58\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST /eSCL/ScanJobs HTTP/1.1\r\nHost: bridge\r\nUser-Agent: AirScanScanner/58\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -326,6 +326,23 @@ fn a_refused_job_request_logs_its_reason_client_and_body() {
                 .any(|line| line.contains("AirScanScanner/58") && line.contains("Grayscale8")),
         )),
         Some((true, true))
+    );
+}
+
+#[test]
+fn control_characters_in_a_request_target_reach_the_log_escaped() {
+    let lines = start(Vec::new()).and_then(|(port, log)| {
+        exchange(
+            port,
+            "GET /eSCL/\u{2028}\u{9d} HTTP/1.1\r\nHost: bridge\r\n\r\n".as_bytes(),
+        )?;
+        Some(lines_until(&log, |line| line.contains(" 404")))
+    });
+    assert_eq!(
+        lines.map(|lines| lines.iter().any(|line| {
+            line.ends_with("GET /eSCL/\\u{2028}\\u{9d} 404") && !line.contains('\u{2028}')
+        })),
+        Some(true)
     );
 }
 

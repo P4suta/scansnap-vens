@@ -75,6 +75,7 @@ fn request(method: &str, target: &str, body: &[u8]) -> HttpRequest {
         method: method.to_owned(),
         target: target.to_owned(),
         user_agent: None,
+        content_type: None,
         body: body.to_vec(),
     }
 }
@@ -82,9 +83,36 @@ fn request(method: &str, target: &str, body: &[u8]) -> HttpRequest {
 #[test]
 fn the_user_agent_names_the_client() {
     assert_eq!(
-        read(b"GET /eSCL/ScannerStatus HTTP/1.1\r\nuser-agent: AirScanScanner/58\r\n\r\n")
-            .map(|request| request.user_agent),
+        read(
+            b"GET /eSCL/ScannerStatus HTTP/1.1\r\nHost: s\r\nuser-agent: AirScanScanner/58\r\n\r\n"
+        )
+        .map(|request| request.user_agent),
         Ok(Some("AirScanScanner/58".to_owned()))
+    );
+}
+
+#[test]
+fn the_content_type_names_the_body_format() {
+    assert_eq!(
+        read(b"POST /eSCL/ScanJobs HTTP/1.1\r\nHost: s\r\nContent-Type: text/xml\r\nContent-Length: 2\r\n\r\nok")
+            .map(|request| request.content_type),
+        Ok(Some("text/xml".to_owned()))
+    );
+}
+
+#[test]
+fn an_http_1_1_request_needs_exactly_one_host() {
+    assert_eq!(
+        [
+            read(b"GET /eSCL/ScannerStatus HTTP/1.1\r\n\r\n"),
+            read(b"GET /eSCL/ScannerStatus HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
+            read(b"GET /eSCL/ScannerStatus HTTP/1.0\r\n\r\n"),
+        ],
+        [
+            Err(ReadError::Malformed),
+            Err(ReadError::Malformed),
+            Ok(request("GET", "/eSCL/ScannerStatus", b"")),
+        ]
     );
 }
 
@@ -99,7 +127,7 @@ fn a_request_without_a_body_reads_its_method_and_target() {
 #[test]
 fn a_body_with_a_length_reads_in_one_byte_pieces() {
     let mut wire = Wire::new(
-        b"POST /eSCL/ScanJobs HTTP/1.1\r\nContent-Length: 11\r\n\r\n<settings/>",
+        b"POST /eSCL/ScanJobs HTTP/1.1\r\nHost: s\r\nContent-Length: 11\r\n\r\n<settings/>",
         1,
     );
     assert_eq!(
@@ -112,7 +140,7 @@ fn a_body_with_a_length_reads_in_one_byte_pieces() {
 fn a_chunked_body_decodes_across_chunks_and_trailers() {
     assert_eq!(
         read(
-            b"POST /eSCL/ScanJobs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\
+            b"POST /eSCL/ScanJobs HTTP/1.1\r\nHost: s\r\nTransfer-Encoding: chunked\r\n\r\n\
               4\r\n<set\r\n7;note=1\r\ntings/>\r\n0\r\nTrailer: value\r\n\r\n"
         ),
         Ok(request("POST", "/eSCL/ScanJobs", b"<settings/>"))
@@ -122,7 +150,7 @@ fn a_chunked_body_decodes_across_chunks_and_trailers() {
 #[test]
 fn an_expectation_of_continue_gets_its_interim_answer_before_the_body() {
     let mut wire = Wire::new(
-        b"POST /eSCL/ScanJobs HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nok",
+        b"POST /eSCL/ScanJobs HTTP/1.1\r\nHost: s\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nok",
         3,
     );
     let read = read_request(&mut wire, LIMITS);
@@ -168,7 +196,7 @@ fn a_head_beyond_its_limit_is_refused() {
 #[test]
 fn a_body_beyond_its_limit_is_refused_before_it_arrives() {
     assert_eq!(
-        read(b"POST /eSCL/ScanJobs HTTP/1.1\r\nContent-Length: 65\r\n\r\n"),
+        read(b"POST /eSCL/ScanJobs HTTP/1.1\r\nHost: s\r\nContent-Length: 65\r\n\r\n"),
         Err(ReadError::BodyTooLarge)
     );
 }
@@ -176,7 +204,7 @@ fn a_body_beyond_its_limit_is_refused_before_it_arrives() {
 #[test]
 fn a_chunked_body_beyond_its_limit_is_refused() {
     let chunk = format!(
-        "POST /eSCL/ScanJobs HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n41\r\n{}\r\n0\r\n\r\n",
+        "POST /eSCL/ScanJobs HTTP/1.1\r\nHost: s\r\nTransfer-Encoding: chunked\r\n\r\n41\r\n{}\r\n0\r\n\r\n",
         "x".repeat(65)
     );
     assert_eq!(read(chunk.as_bytes()), Err(ReadError::BodyTooLarge));
@@ -187,7 +215,7 @@ fn malformed_heads_and_chunk_sizes_are_refused() {
     assert_eq!(
         [
             read(b"GET /eSCL/ScannerStatus HTTP/9\r\n\r\n"),
-            read(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"),
+            read(b"POST / HTTP/1.1\r\nHost: s\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"),
         ],
         [Err(ReadError::Malformed), Err(ReadError::Malformed)]
     );
@@ -207,7 +235,7 @@ fn a_connection_that_closes_early_is_closed() {
         [
             read(b""),
             read(b"GET / HTTP/1.1\r\nHost"),
-            read(b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nok"),
+            read(b"POST / HTTP/1.1\r\nHost: s\r\nContent-Length: 4\r\n\r\nok"),
         ],
         [
             Err(ReadError::Closed),

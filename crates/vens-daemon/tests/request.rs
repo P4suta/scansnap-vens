@@ -18,6 +18,7 @@ fn http(method: &str, target: &str, body: &str) -> HttpRequest {
         method: method.to_owned(),
         target: target.to_owned(),
         user_agent: None,
+        content_type: None,
         body: body.as_bytes().to_vec(),
     }
 }
@@ -121,6 +122,43 @@ fn an_unsupported_setting_reaches_the_bridge_by_name() {
 }
 
 #[test]
+fn a_job_request_with_a_media_type_that_a_browser_form_sends_is_malformed() {
+    let body = settings(("scan", "pwg"), "<scan:Duplex>true</scan:Duplex>");
+    let typed = |media: Option<&str>| {
+        escl_request(&HttpRequest {
+            content_type: media.map(str::to_owned),
+            ..http("POST", "/eSCL/ScanJobs", &body)
+        })
+    };
+    assert_eq!(
+        [
+            typed(Some("text/plain")),
+            typed(Some("Text/Plain; charset=utf-8")),
+            typed(Some("application/x-www-form-urlencoded")),
+            typed(Some("multipart/form-data; boundary=x")),
+            typed(Some("text/xml")),
+            typed(Some("application/xml; charset=utf-8")),
+            typed(None),
+        ],
+        [
+            Request::Malformed,
+            Request::Malformed,
+            Request::Malformed,
+            Request::Malformed,
+            duplex(),
+            duplex(),
+            duplex(),
+        ]
+    );
+}
+
+#[test]
+fn a_deeply_nested_settings_body_is_malformed() {
+    let nested = format!("{}{}", "<a>".repeat(300), "</a>".repeat(300));
+    assert_eq!(job(&settings(("scan", "pwg"), &nested)), Request::Malformed);
+}
+
+#[test]
 fn an_unreadable_settings_body_is_malformed() {
     let foreign_root = format!(r#"<scan:ScanJob xmlns:scan="{SCAN}"/>"#);
     let entity =
@@ -129,6 +167,7 @@ fn an_unreadable_settings_body_is_malformed() {
         method: "POST".to_owned(),
         target: "/eSCL/ScanJobs".to_owned(),
         user_agent: None,
+        content_type: None,
         body: [0xFF, 0xFE, 0x3C].to_vec(),
     };
     assert_eq!(

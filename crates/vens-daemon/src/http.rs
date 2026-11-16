@@ -23,6 +23,8 @@ pub struct HttpRequest {
     pub target: String,
     /// The client's `User-Agent` field, which the log shows beside a refused job request.
     pub user_agent: Option<String>,
+    /// The `Content-Type` field, which tells a scan client's body from a browser form.
+    pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -42,9 +44,17 @@ struct Head {
     method: String,
     target: String,
     user_agent: Option<String>,
+    content_type: Option<String>,
     framing: Framing,
     expects_continue: bool,
     length: usize,
+}
+
+fn field(headers: &[httparse::Header<'_>], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| String::from_utf8_lossy(header.value).into_owned())
 }
 
 fn parse_head(bytes: &[u8]) -> Result<Option<Head>, ReadError> {
@@ -73,18 +83,22 @@ fn parse_head(bytes: &[u8]) -> Result<Option<Head>, ReadError> {
             header.name.eq_ignore_ascii_case("expect")
                 && header.value.eq_ignore_ascii_case(b"100-continue")
         });
-    let user_agent = request
+    let hosts = request
         .headers
         .iter()
-        .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
-        .map(|header| String::from_utf8_lossy(header.value).into_owned());
+        .filter(|header| header.name.eq_ignore_ascii_case("host"))
+        .count();
+    if request.version == Some(1) && hosts != 1 {
+        return Err(ReadError::Malformed);
+    }
     let (Some(method), Some(target)) = (request.method, request.path) else {
         return Err(ReadError::Malformed);
     };
     Ok(Some(Head {
         method: method.to_owned(),
         target: target.to_owned(),
-        user_agent,
+        user_agent: field(request.headers, "user-agent"),
+        content_type: field(request.headers, "content-type"),
         framing,
         expects_continue,
         length,
@@ -243,6 +257,7 @@ pub fn read_request<S: Read + Write>(
         method: head.method,
         target: head.target,
         user_agent: head.user_agent,
+        content_type: head.content_type,
         body,
     })
 }

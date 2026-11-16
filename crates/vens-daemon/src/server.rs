@@ -142,12 +142,17 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
             .take(BODY_EXCERPT)
             .collect();
         format!(
-            "client {:?}, body {body:?}",
-            request.user_agent.as_deref().unwrap_or("unnamed")
+            "client {:?}, type {:?}, body {body:?}",
+            request.user_agent.as_deref().unwrap_or("unnamed"),
+            request.content_type.as_deref().unwrap_or("none")
         )
     });
     let responder = Responder {
-        line: format!("{peer} {} {}", request.method, request.target),
+        line: format!(
+            "{peer} {} {}",
+            request.method.escape_debug(),
+            request.target.escape_debug()
+        ),
         detail,
         reply,
     };

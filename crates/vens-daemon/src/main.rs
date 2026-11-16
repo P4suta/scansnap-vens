@@ -21,7 +21,7 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const DEADLINE: Duration = Duration::from_secs(30);
 const LIMITS: Limits = Limits {
     head: 16_384,
-    body: 65_536,
+    body: 8_192,
 };
 /// Gives each request this long to arrive in full; eSCL requests are a few kilobytes at most.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
