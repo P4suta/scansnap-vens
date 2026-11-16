@@ -1,3 +1,5 @@
+use core::mem;
+
 use crate::{
     document::{AdfState, Capabilities, JobInfo, JobState, ScannerState, ScannerStatus},
     route::{JobPath, Method, Unrouted},
@@ -5,9 +7,11 @@ use crate::{
     uuid::Uuid,
 };
 
-/// How long the feeder state that a refused job request found stays in the status.
+/// How long the feeder state that a refused job request or a drained job shows stays in the status.
+///
+/// sane-airscan checks the status before each job, so a longer stay would refuse the next scan.
 pub const HINT_MILLIS: u64 = 10_000;
-/// How long a finished job stays after its end or its last page request, whichever came later.
+/// How long a finished job with pending pages stays after its end or its last page request, whichever came later.
 pub const RETENTION_MILLIS: u64 = 60_000;
 
 /// A reading of the owner's monotonic clock.
@@ -35,6 +39,8 @@ pub enum Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     NoPaper,
+    /// The scanner has no registered host, which one pairing with the vendor software fixes.
+    Unregistered,
     Busy,
     Unreachable,
 }
@@ -80,6 +86,7 @@ pub enum Input<R, P> {
 pub enum Conflict {
     Unsupported(Unsupported),
     NoPaper,
+    Unregistered,
     Failed(Fault),
 }
 
@@ -230,14 +237,20 @@ struct Hint {
     until: Moment,
 }
 
+/// Waits between jobs with the feeder state that a refusal found, or runs one job.
+#[derive(Debug, Clone)]
+enum Activity<R, P, const N: usize> {
+    Idle(Option<Hint>),
+    Busy(Job<R, P, N>),
+}
+
 /// The state of a bridge that runs one job at a time and keeps up to `N` pages for its client.
 #[derive(Debug, Clone)]
 pub struct Bridge<R, P, const N: usize> {
     uuid: Uuid,
     seed: [u8; 16],
     jobs: u32,
-    job: Option<Job<R, P, N>>,
-    hint: Option<Hint>,
+    activity: Activity<R, P, N>,
 }
 
 fn job_id(seed: [u8; 16], number: u32) -> Uuid {
@@ -277,9 +290,23 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             uuid,
             seed,
             jobs: 0,
-            job: None,
-            hint: None,
+            activity: Activity::Idle(None),
         }
+    }
+
+    /// Takes the running job out of the state, and leaves an idle state with any hint in place.
+    fn take_job(&mut self) -> Option<Job<R, P, N>> {
+        match mem::replace(&mut self.activity, Activity::Idle(None)) {
+            Activity::Busy(job) => Some(job),
+            idle @ Activity::Idle(_) => {
+                self.activity = idle;
+                None
+            }
+        }
+    }
+
+    fn keep(&mut self, job: Job<R, P, N>) {
+        self.activity = Activity::Busy(job);
     }
 
     /// Decides the effects of one input at the moment `now`, after dropping state that expired before it.
@@ -296,13 +323,23 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
     }
 
     fn expire(mut self, now: Moment) -> Self {
-        if self.hint.is_some_and(|hint| now >= hint.until) {
-            self.hint = None;
-        }
-        if self.job.as_ref().is_some_and(|job| {
-            matches!(job.phase, Phase::Finished(_)) && now >= job.touched.after(RETENTION_MILLIS)
-        }) {
-            self.job = None;
+        let expired = match &self.activity {
+            Activity::Idle(Some(hint)) => now >= hint.until,
+            Activity::Idle(None) => false,
+            Activity::Busy(job) => match job.phase {
+                Phase::Finished(_) => {
+                    let stay = if job.pages.is_empty() {
+                        HINT_MILLIS
+                    } else {
+                        RETENTION_MILLIS
+                    };
+                    now >= job.touched.after(stay)
+                }
+                Phase::Starting(_) | Phase::Scanning { .. } | Phase::Canceled => false,
+            },
+        };
+        if expired {
+            self.activity = Activity::Idle(None);
         }
         self
     }
@@ -327,12 +364,15 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
     }
 
     fn status(&self) -> ScannerStatus {
-        let Some(job) = &self.job else {
-            return ScannerStatus {
-                state: ScannerState::Idle,
-                adf: self.hint.map_or(AdfState::Loaded, |hint| hint.adf),
-                job: None,
-            };
+        let job = match &self.activity {
+            Activity::Idle(hint) => {
+                return ScannerStatus {
+                    state: ScannerState::Idle,
+                    adf: hint.map_or(AdfState::Loaded, |hint| hint.adf),
+                    job: None,
+                };
+            }
+            Activity::Busy(job) => job,
         };
         let info = |state| {
             Some(JobInfo {
@@ -374,10 +414,13 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
     }
 
     fn create(mut self, settings: JobSettings, responder: R, now: Moment) -> (Self, Effects<R, P>) {
-        let busy = self.job.as_ref().is_some_and(|job| match job.phase {
-            Phase::Starting(_) | Phase::Scanning { .. } | Phase::Canceled => true,
-            Phase::Finished(_) => !job.pages.is_empty(),
-        });
+        let busy = match &self.activity {
+            Activity::Idle(_) => false,
+            Activity::Busy(job) => match job.phase {
+                Phase::Starting(_) | Phase::Scanning { .. } | Phase::Canceled => true,
+                Phase::Finished(_) => !job.pages.is_empty(),
+            },
+        };
         if busy {
             return (
                 self,
@@ -385,7 +428,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             );
         }
         let jobs = self.jobs.wrapping_add(1);
-        self.job = Some(Job {
+        self.keep(Job {
             id: job_id(self.seed, jobs),
             sides: settings.sides(),
             phase: Phase::Starting(responder),
@@ -395,25 +438,24 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             touched: now,
         });
         self.jobs = jobs;
-        self.hint = None;
         (self, Effects::one(Effect::Start(settings)))
     }
 
     fn reserved(mut self) -> (Self, Effects<R, P>) {
-        let Some(job) = self.job.take() else {
+        let Some(job) = self.take_job() else {
             return (self, Effects::none());
         };
         let effects = match job.phase {
             Phase::Starting(responder) => {
                 let id = job.id;
-                self.job = Some(Job {
+                self.keep(Job {
                     phase: Phase::Scanning { waiter: None },
                     ..job
                 });
                 Effects::reply(responder, Response::Created(JobPath::new(id)))
             }
             phase @ (Phase::Scanning { .. } | Phase::Canceled | Phase::Finished(_)) => {
-                self.job = Some(Job { phase, ..job });
+                self.keep(Job { phase, ..job });
                 Effects::none()
             }
         };
@@ -421,26 +463,27 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
     }
 
     fn refused(mut self, refusal: Refusal, now: Moment) -> (Self, Effects<R, P>) {
-        let Some(job) = self.job.take() else {
+        let Some(job) = self.take_job() else {
             return (self, Effects::none());
         };
         let effects = match job.phase {
             Phase::Starting(responder) => {
                 let response = match refusal {
                     Refusal::NoPaper => {
-                        self.hint = Some(Hint {
+                        self.activity = Activity::Idle(Some(Hint {
                             adf: AdfState::Empty,
                             until: now.after(HINT_MILLIS),
-                        });
+                        }));
                         Response::Conflict(Conflict::NoPaper)
                     }
+                    Refusal::Unregistered => Response::Conflict(Conflict::Unregistered),
                     Refusal::Busy => Response::Unavailable(Unavailable::ScannerBusy),
                     Refusal::Unreachable => Response::Unavailable(Unavailable::ScannerUnreachable),
                 };
                 Effects::reply(responder, response)
             }
             phase @ (Phase::Scanning { .. } | Phase::Canceled | Phase::Finished(_)) => {
-                self.job = Some(Job { phase, ..job });
+                self.keep(Job { phase, ..job });
                 Effects::none()
             }
         };
@@ -448,7 +491,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
     }
 
     fn page(mut self, side: Side, page: P) -> (Self, Effects<R, P>) {
-        let Some(mut job) = self.job.take() else {
+        let Some(mut job) = self.take_job() else {
             return (self, Effects::none());
         };
         let wanted = !(job.sides == Sides::Front && side == Side::Back);
@@ -457,7 +500,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                 waiter: Some(responder),
             } if wanted => {
                 job.delivered = job.delivered.saturating_add(1);
-                self.job = Some(Job {
+                self.keep(Job {
                     phase: Phase::Scanning { waiter: None },
                     ..job
                 });
@@ -467,7 +510,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                 if job.pages.push(page).is_err() {
                     job.lost = job.lost.saturating_add(1);
                 }
-                self.job = Some(Job {
+                self.keep(Job {
                     phase: Phase::Scanning { waiter: None },
                     ..job
                 });
@@ -477,7 +520,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             | Phase::Scanning { .. }
             | Phase::Canceled
             | Phase::Finished(_)) => {
-                self.job = Some(Job { phase, ..job });
+                self.keep(Job { phase, ..job });
                 Effects::none()
             }
         };
@@ -485,7 +528,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
     }
 
     fn finished(mut self, ending: Ending, now: Moment) -> (Self, Effects<R, P>) {
-        let Some(job) = self.job.take() else {
+        let Some(job) = self.take_job() else {
             return (self, Effects::none());
         };
         let effects = match job.phase {
@@ -494,7 +537,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                     Ending::Completed if job.lost > 0 => Ending::Failed(Fault::Lost),
                     Ending::Completed | Ending::Failed(_) => ending,
                 };
-                self.job = Some(Job {
+                self.keep(Job {
                     phase: Phase::Finished(ending),
                     touched: now,
                     ..job
@@ -509,7 +552,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             ),
             Phase::Canceled => Effects::none(),
             phase @ Phase::Finished(_) => {
-                self.job = Some(Job { phase, ..job });
+                self.keep(Job { phase, ..job });
                 Effects::none()
             }
         };
@@ -517,11 +560,11 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
     }
 
     fn next_document(mut self, id: Uuid, responder: R, now: Moment) -> (Self, Effects<R, P>) {
-        let Some(mut job) = self.job.take() else {
+        let Some(mut job) = self.take_job() else {
             return (self, Effects::reply(responder, Response::NotFound));
         };
         if job.id != id {
-            self.job = Some(job);
+            self.keep(job);
             return (self, Effects::reply(responder, Response::NotFound));
         }
         let effects = match job.phase {
@@ -529,13 +572,13 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                 job.touched = now;
                 if let Some(page) = job.pages.pop() {
                     job.delivered = job.delivered.saturating_add(1);
-                    self.job = Some(Job {
+                    self.keep(Job {
                         phase: Phase::Scanning { waiter },
                         ..job
                     });
                     Effects::reply(responder, Response::Page(page))
                 } else {
-                    self.job = Some(Job {
+                    self.keep(Job {
                         phase: Phase::Scanning {
                             waiter: Some(responder),
                         },
@@ -555,14 +598,14 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                         Response::Page(page)
                     },
                 );
-                self.job = Some(Job {
+                self.keep(Job {
                     phase: Phase::Finished(ending),
                     ..job
                 });
                 Effects::reply(responder, response)
             }
             phase @ (Phase::Starting(_) | Phase::Canceled) => {
-                self.job = Some(Job { phase, ..job });
+                self.keep(Job { phase, ..job });
                 Effects::reply(responder, Response::NotFound)
             }
         };
@@ -570,16 +613,16 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
     }
 
     fn delete(mut self, id: Uuid, responder: R) -> (Self, Effects<R, P>) {
-        let Some(job) = self.job.take() else {
+        let Some(job) = self.take_job() else {
             return (self, Effects::reply(responder, Response::NotFound));
         };
         if job.id != id {
-            self.job = Some(job);
+            self.keep(job);
             return (self, Effects::reply(responder, Response::NotFound));
         }
         let effects = match job.phase {
             Phase::Scanning { waiter } => {
-                self.job = Some(Job {
+                self.keep(Job {
                     phase: Phase::Canceled,
                     pages: Queue::new(),
                     ..job
@@ -598,7 +641,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             }
             Phase::Finished(_) => Effects::reply(responder, Response::Deleted),
             phase @ (Phase::Starting(_) | Phase::Canceled) => {
-                self.job = Some(Job { phase, ..job });
+                self.keep(Job { phase, ..job });
                 Effects::reply(responder, Response::NotFound)
             }
         };

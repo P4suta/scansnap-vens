@@ -240,7 +240,13 @@ fn an_unsupported_setting_is_refused_without_a_job() {
 
 #[test]
 fn each_refusal_answers_the_job_request_and_frees_the_bridge() {
-    let answers = [Refusal::NoPaper, Refusal::Busy, Refusal::Unreachable].map(|refusal| {
+    let answers = [
+        Refusal::NoPaper,
+        Refusal::Unregistered,
+        Refusal::Busy,
+        Refusal::Unreachable,
+    ]
+    .map(|refusal| {
         let (_, log) = feed(
             Bridge4::new(UUID, SEED),
             [
@@ -255,11 +261,113 @@ fn each_refusal_answers_the_job_request_and_frees_the_bridge() {
         answers,
         [
             Response::Conflict(Conflict::NoPaper),
+            Response::Conflict(Conflict::Unregistered),
             Response::Unavailable(Unavailable::ScannerBusy),
             Response::Unavailable(Unavailable::ScannerUnreachable),
         ]
         .map(|response| Some([reply("post", response), start()].to_vec()))
     );
+}
+
+#[test]
+fn a_refusal_hint_never_returns_after_a_later_job() {
+    let (bridge, log) = feed(
+        Bridge4::new(UUID, SEED),
+        [
+            (0, request(Request::CreateJob(duplex()), "post")),
+            (1, Input::Refused(Refusal::NoPaper)),
+            (1000, request(Request::CreateJob(duplex()), "again")),
+            (1001, Input::Reserved),
+        ],
+    );
+    let status = created(log.last()).map(|id| {
+        let (bridge, _) = feed(
+            bridge,
+            [
+                (1002, Input::Finished(Ending::Completed)),
+                (1003, request(Request::DeleteJob(id), "delete")),
+            ],
+        );
+        status_of(&bridge, 1004)
+    });
+    assert_eq!(status, Some(IDLE));
+}
+
+#[test]
+fn a_drained_job_that_nobody_deletes_shows_its_end_for_the_hint_time() {
+    check(started::<4>(duplex()).map(|(bridge, id)| {
+        let (bridge, _) = feed(
+            bridge,
+            [
+                (2, page(Side::Front, "front")),
+                (3, Input::Finished(Ending::Completed)),
+                (4, request(Request::NextDocument(id), "page")),
+                (5, request(Request::NextDocument(id), "end")),
+            ],
+        );
+        (
+            (
+                status_of(&bridge, 5 + HINT_MILLIS - 1),
+                status_of(&bridge, 5 + HINT_MILLIS),
+            ),
+            (
+                Some(ScannerStatus {
+                    state: ScannerState::Idle,
+                    adf: AdfState::Empty,
+                    job: Some(info(id, 1, 0, JobState::Completed)),
+                }),
+                IDLE,
+            ),
+        )
+    }));
+}
+
+#[test]
+fn a_page_request_on_a_finished_job_restarts_its_retention() {
+    check(started::<4>(duplex()).map(|(bridge, id)| {
+        let (bridge, _) = feed(
+            bridge,
+            [
+                (2, page(Side::Front, "front")),
+                (3, page(Side::Back, "back")),
+                (4, Input::Finished(Ending::Completed)),
+                (
+                    4 + RETENTION_MILLIS - 1,
+                    request(Request::NextDocument(id), "late"),
+                ),
+            ],
+        );
+        (
+            status_of(&bridge, 4 + RETENTION_MILLIS + 5),
+            Some(ScannerStatus {
+                state: ScannerState::Processing,
+                adf: AdfState::Loaded,
+                job: Some(info(id, 1, 1, JobState::Processing)),
+            }),
+        )
+    }));
+}
+
+#[test]
+fn requests_for_another_job_leave_the_running_job_in_place() {
+    check(started::<4>(duplex()).map(|(bridge, id)| {
+        let (bridge, _) = feed(
+            bridge,
+            [
+                (2, request(Request::NextDocument(OTHER), "next")),
+                (3, request(Request::DeleteJob(OTHER), "delete")),
+                (4, page(Side::Front, "front")),
+            ],
+        );
+        (
+            status_of(&bridge, 5),
+            Some(ScannerStatus {
+                state: ScannerState::Processing,
+                adf: AdfState::Loaded,
+                job: Some(info(id, 0, 1, JobState::Processing)),
+            }),
+        )
+    }));
 }
 
 #[test]
