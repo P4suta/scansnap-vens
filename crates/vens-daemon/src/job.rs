@@ -14,7 +14,7 @@ use vens_net::{
     network::Network,
     operation::{self, JobRun},
     scan::{PageSink, ScanError},
-    session::JobFailure,
+    session::{JobFailure, PrepareError},
 };
 
 /// What the job thread tells the owner, in order: a refusal, or the reserve, each page, and the end.
@@ -73,11 +73,8 @@ fn refuse<T: Report>(report: &mut T, refusal: Refusal, detail: &impl Debug) {
 }
 
 fn ending<E: Debug>(run: JobRun<E, JpegError>) -> (Ending, Option<String>) {
-    let keepalive = run
-        .keepalive_failure
-        .map(|failure| format!("keepalive failed: {failure:?}"));
-    match run.outcome {
-        Ok(_) => (Ending::Completed, keepalive),
+    let (ending, failure) = match run.outcome {
+        Ok(_) => (Ending::Completed, None),
         Err(JobFailure::Release { failure, .. }) => (
             Ending::Completed,
             Some(format!("release failed: {failure:?}")),
@@ -93,7 +90,15 @@ fn ending<E: Debug>(run: JobRun<E, JpegError>) -> (Ending, Option<String>) {
                 Some(format!("{failure:?}; release: {release:?}")),
             )
         }
-    }
+    };
+    let keepalive = run
+        .keepalive_failure
+        .map(|failure| format!("keepalive failed: {failure:?}"));
+    let detail = match (failure, keepalive) {
+        (Some(failure), Some(keepalive)) => Some(format!("{failure}; {keepalive}")),
+        (failure, keepalive) => failure.or(keepalive),
+    };
+    (ending, detail)
 }
 
 /// Runs one job on the scanner at `target`, which may be the broadcast address, and reports each step.
@@ -111,6 +116,13 @@ where
     };
     let prepared = match connected.prepare() {
         Ok(prepared) => prepared,
+        Err(PrepareError::NotRegistered) => {
+            return refuse(
+                report,
+                Refusal::Unregistered,
+                &PrepareError::<N::Error>::NotRegistered,
+            );
+        }
         Err(failure) => return refuse(report, Refusal::Unreachable, &failure),
     };
     match prepared.paper() {

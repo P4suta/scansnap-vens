@@ -3,7 +3,7 @@
 
 use std::{
     collections::VecDeque,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::mpsc,
     thread,
@@ -56,14 +56,26 @@ impl Log for Lines {
     }
 }
 
-/// Starts a daemon on a free loopback port with one recorded session for each job, and returns its port and its log.
-fn start(sessions: Vec<Vec<Event>>) -> Option<(u16, mpsc::Receiver<String>)> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
-    let port = listener.local_addr().ok()?.port();
+/// Starts a daemon on free loopback ports with one recorded session for each job, and returns its ports and its log.
+fn start_on<const L: usize>(
+    config: Config,
+    sessions: Vec<Vec<Event>>,
+) -> Option<([u16; L], mpsc::Receiver<String>)> {
+    let listeners = [(); L].map(|()| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok());
+    let listeners: Vec<TcpListener> = listeners.into_iter().collect::<Option<_>>()?;
+    let mut ports = [0; L];
+    for (port, listener) in ports.iter_mut().zip(&listeners) {
+        *port = listener.local_addr().ok()?.port();
+    }
     let (lines, log) = mpsc::channel();
     let networks = Fixtures(sessions.into());
-    thread::spawn(move || serve(&listener, networks, CONFIG, Lines(lines)));
-    Some((port, log))
+    thread::spawn(move || serve(&listeners, networks, config, Lines(lines)));
+    Some((ports, log))
+}
+
+/// Starts a daemon on one free loopback port, and returns its port and its log.
+fn start(sessions: Vec<Vec<Event>>) -> Option<(u16, mpsc::Receiver<String>)> {
+    start_on::<1>(CONFIG, sessions).map(|([port], log)| (port, log))
 }
 
 fn events(fixture: &str) -> Vec<Event> {
@@ -279,7 +291,11 @@ fn a_client_that_trickles_its_request_is_cut_off_at_the_request_deadline() {
                 }
             });
             let mut answer = Vec::new();
-            let closed = reader.read_to_end(&mut answer).is_ok();
+            // A close with unread bytes in the server's buffer arrives as a reset, which ends the connection too.
+            let closed = match reader.read_to_end(&mut answer) {
+                Ok(_) => true,
+                Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+            };
             Some((
                 closed && answer.is_empty(),
                 started.elapsed() < Duration::from_secs(2),
@@ -287,6 +303,36 @@ fn a_client_that_trickles_its_request_is_cut_off_at_the_request_deadline() {
         })
     });
     assert_eq!(checks, Some((true, true)));
+}
+
+#[test]
+fn three_silent_connections_leave_an_acceptor_for_another_client() {
+    let patient = Config {
+        request_timeout: Duration::from_secs(3),
+        ..CONFIG
+    };
+    let checks = start_on::<1>(patient, Vec::new()).and_then(|([port], _log)| {
+        let silent: Vec<TcpStream> = (0..3)
+            .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, port)).ok())
+            .collect::<Option<_>>()?;
+        let started = Instant::now();
+        let answered = get(port, "/eSCL/ScannerCapabilities")?.code;
+        let elapsed = started.elapsed();
+        drop(silent);
+        Some((answered, elapsed < Duration::from_secs(1)))
+    });
+    assert_eq!(checks, Some((200, true)));
+}
+
+#[test]
+fn each_listener_answers_requests() {
+    let codes = start_on::<2>(CONFIG, Vec::new()).and_then(|(ports, _log)| {
+        ports
+            .iter()
+            .map(|port| get(*port, "/eSCL/ScannerCapabilities").map(|answer| answer.code))
+            .collect::<Option<Vec<_>>>()
+    });
+    assert_eq!(codes, Some([200, 200].to_vec()));
 }
 
 /// Reads log lines until one matches, and returns every line read.

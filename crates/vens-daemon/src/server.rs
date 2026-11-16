@@ -195,15 +195,22 @@ fn start_job<'scope, S: Networks>(
     target: Ipv4Addr,
     events: &Sender<Event>,
 ) {
-    let mut report = ToOwner(events.clone());
-    match networks.network() {
-        Some(mut network) => {
-            scope.spawn(move || run_job(&mut network, target, &mut report));
-        }
-        None => report.report(JobEvent::Refused {
+    let mut fallback = ToOwner(events.clone());
+    let Some(mut network) = networks.network() else {
+        return fallback.report(JobEvent::Refused {
             refusal: Refusal::Unreachable,
             detail: "no network for the job".to_owned(),
-        }),
+        });
+    };
+    let mut report = ToOwner(events.clone());
+    let spawned = thread::Builder::new()
+        .name("vensd job".to_owned())
+        .spawn_scoped(scope, move || run_job(&mut network, target, &mut report));
+    if let Err(error) = spawned {
+        fallback.report(JobEvent::Refused {
+            refusal: Refusal::Unreachable,
+            detail: format!("the job thread couldn't start: {error}"),
+        });
     }
 }
 
@@ -300,16 +307,23 @@ fn own<'scope, S: Networks, L: Log>(
 ///
 /// One thread owns the bridge state, and the others only send it events: each accepted request, and each step of the running job.
 pub fn serve<S: Networks, L: Log>(
-    listener: &TcpListener,
+    listeners: &[TcpListener],
     mut networks: S,
     config: Config,
     mut log: L,
 ) {
     let (events, inbox) = mpsc::channel();
     thread::scope(|scope| {
-        for _ in 0..ACCEPTORS {
-            let events = events.clone();
-            scope.spawn(move || accept(listener, config, &events));
+        for listener in listeners {
+            for _ in 0..ACCEPTORS {
+                let acceptor_events = events.clone();
+                let spawned = thread::Builder::new()
+                    .name("vensd acceptor".to_owned())
+                    .spawn_scoped(scope, move || accept(listener, config, &acceptor_events));
+                if let Err(error) = spawned {
+                    line(&events, format!("an acceptor couldn't start: {error}"));
+                }
+            }
         }
         own(scope, &inbox, &events, &mut networks, config, &mut log);
     });

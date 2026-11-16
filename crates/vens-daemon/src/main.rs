@@ -78,24 +78,38 @@ impl Log for Stderr {
     }
 }
 
-/// Listens on both address families where the host allows it, and on IPv4 alone otherwise.
-fn bind(port: u16) -> io::Result<TcpListener> {
-    TcpListener::bind((Ipv6Addr::UNSPECIFIED, port))
-        .or_else(|_| TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)))
+/// Listens on IPv6 and IPv4 wherever the host permits.
+///
+/// A dual-stack IPv6 socket already takes the IPv4 port, so the IPv4 bind may fail beside it; a host with IPv6-only sockets keeps both.
+fn bind(port: u16) -> io::Result<Vec<TcpListener>> {
+    match (
+        TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)),
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)),
+    ) {
+        (Ok(six), Ok(four)) => Ok(Vec::from([six, four])),
+        (Ok(only), Err(_)) | (Err(_), Ok(only)) => Ok(Vec::from([only])),
+        (Err(error), Err(_)) => Err(error),
+    }
 }
 
 fn serve(port: u16, target: Ipv4Addr, uuid: Uuid) -> ExitCode {
     let mut log = Stderr;
-    let listener = match bind(port) {
-        Ok(listener) => listener,
+    let listeners = match bind(port) {
+        Ok(listeners) => listeners,
         Err(error) => {
             log.record(&format!("can't listen on port {port}: {error}"));
             return ExitCode::FAILURE;
         }
     };
-    let local = listener
-        .local_addr()
-        .map_or_else(|_| format!("port {port}"), |address| address.to_string());
+    let local = listeners
+        .iter()
+        .map(|listener| {
+            listener
+                .local_addr()
+                .map_or_else(|_| format!("port {port}"), |address| address.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" and ");
     log.record(&format!(
         "listening on {local} as {uuid}, scanner at {target}"
     ));
@@ -107,7 +121,7 @@ fn serve(port: u16, target: Ipv4Addr, uuid: Uuid) -> ExitCode {
         request_timeout: REQUEST_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
     };
-    server::serve(&listener, System, config, log);
+    server::serve(&listeners, System, config, log);
     ExitCode::FAILURE
 }
 

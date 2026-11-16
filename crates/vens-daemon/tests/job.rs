@@ -21,6 +21,10 @@ const RELEASE_REPLY: usize = 162;
 const HOST_ID: usize = 0x20;
 const RESULT: usize = 8;
 const QUALIFIER: usize = 13;
+const ONE_SHEET_FRONT_IMAGE: usize = 76;
+const ONE_SHEET_LAST_SENSE: usize = 96;
+/// The height in the frame header of the recorded front image, after the two leading bytes and the comment segment.
+const FRAME_HEIGHT: usize = 28;
 
 #[derive(Default)]
 struct Reports(Vec<JobEvent>);
@@ -140,7 +144,7 @@ fn a_scanner_held_by_another_host_is_busy() {
 }
 
 #[test]
-fn a_silent_or_unregistered_scanner_is_unreachable() {
+fn a_silent_scanner_is_unreachable_and_an_unregistered_one_needs_pairing() {
     assert_eq!(
         [
             seen(silent()),
@@ -148,8 +152,55 @@ fn a_silent_or_unregistered_scanner_is_unreachable() {
         ],
         [
             Some([Seen::Refused(Refusal::Unreachable)].to_vec()),
-            Some([Seen::Refused(Refusal::Unreachable)].to_vec()),
+            Some([Seen::Refused(Refusal::Unregistered)].to_vec()),
         ]
+    );
+}
+
+/// Runs a job and keeps the frame height of each page and the detail of the end.
+fn heights_and_detail(events: Vec<Event>) -> Option<(Vec<Option<u16>>, Option<String>)> {
+    let mut network = FixtureNetwork::new(events)?;
+    let mut reports = Reports::default();
+    run_job(&mut network, Ipv4Addr::BROADCAST, &mut reports);
+    let mut heights = Vec::new();
+    let mut ending = None;
+    for event in reports.0 {
+        match event {
+            JobEvent::Page { page, .. } => {
+                heights.push(frame_size(&page).ok().map(|frame| frame.height));
+            }
+            JobEvent::Finished { detail, .. } => ending = detail,
+            JobEvent::Reserved | JobEvent::Refused { .. } => {}
+        }
+    }
+    Some((heights, ending))
+}
+
+#[test]
+fn each_page_takes_the_real_height_from_the_pixel_size_reply() {
+    let padded_front = changed(
+        ONE_SHEET,
+        ONE_SHEET_FRONT_IMAGE,
+        FRAME_HEIGHT,
+        &[0x29, 0x50],
+    );
+    assert_eq!(
+        heights_and_detail(padded_front).map(|(heights, _)| heights),
+        Some([Some(3648), Some(3648)].to_vec())
+    );
+}
+
+#[test]
+fn a_failed_job_keeps_its_keepalive_failure_in_the_detail() {
+    let jammed = changed(ONE_SHEET, ONE_SHEET_LAST_SENSE, QUALIFIER, &[0x01]);
+    assert_eq!(
+        heights_and_detail(jammed)
+            .and_then(|(_, detail)| detail)
+            .map(|detail| (
+                detail.contains("PaperJam"),
+                detail.contains("keepalive failed")
+            )),
+        Some((true, true))
     );
 }
 
