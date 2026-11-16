@@ -7,12 +7,14 @@ use vens_core::{
     HostId, Ipv4Address, MacAddress, Port,
     control::{LocalTime, Release, Reserve, ReserveMode, ReserveRefusal, UtcOffset},
     job::{JobError, Pause, Summary},
+    keepalive::Elapsed,
     scan::Side,
     sense::Condition,
 };
 use vens_net::{
     channel::{CommandChannel, Stream},
     control::{ControlChannel, ControlError},
+    keepalive::Keepalive,
     scan::{Clock, PageSink, ScanError},
     session::{Host, SessionError, scan_once},
 };
@@ -63,6 +65,19 @@ struct Instant;
 
 impl Clock for Instant {
     fn wait(&mut self, _: Pause) {}
+
+    fn now(&mut self) -> Elapsed {
+        Elapsed::from_millis(0)
+    }
+}
+
+#[derive(Default)]
+struct Ticks(usize);
+
+impl Keepalive for Ticks {
+    fn tick(&mut self, _: Elapsed) {
+        self.0 = self.0.saturating_add(1);
+    }
 }
 
 #[derive(Default)]
@@ -190,20 +205,43 @@ fn expected_reserve() -> Option<Vec<u8>> {
 
 type Outcome = Result<Summary, SessionError<Closed, Never>>;
 
-fn session(command: &[Vec<u8>], control: &[Vec<u8>]) -> Option<(Outcome, Vec<u8>, usize)> {
+fn ticked_session(
+    command: &[Vec<u8>],
+    control: &[Vec<u8>],
+) -> Option<(Outcome, Vec<u8>, usize, usize)> {
     let mut command = CommandChannel::open(Wire::new(command), MAC, ADDRESS).ok()?;
     let mut control = ControlChannel::open(Wire::new(control)).ok()?;
+    let mut ticks = Ticks::default();
     let mut sink = Finished::default();
     let mut buffer = [0_u8; 64];
     let outcome = scan_once(
         &mut command,
         &mut control,
+        &mut ticks,
         host()?,
         &mut Instant,
         &mut sink,
         &mut buffer,
     );
-    Some((outcome, control.into_stream().outgoing, sink.0.len()))
+    Some((
+        outcome,
+        control.into_stream().outgoing,
+        sink.0.len(),
+        ticks.0,
+    ))
+}
+
+fn session(command: &[Vec<u8>], control: &[Vec<u8>]) -> Option<(Outcome, Vec<u8>, usize)> {
+    ticked_session(command, control).map(|(outcome, sent, sides, _)| (outcome, sent, sides))
+}
+
+#[test]
+fn the_session_ticks_the_keepalive_before_every_job_command() {
+    let control = [greeting(), control_reply(20, 0), control_reply(16, 0)];
+    assert_eq!(
+        ticked_session(&one_sheet(), &control).map(|(outcome, _, _, ticks)| (outcome, ticks)),
+        Some((Ok(Summary { sheets: 1 }), 15))
+    );
 }
 
 #[test]

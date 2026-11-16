@@ -4,12 +4,13 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
     path::PathBuf,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use vens_core::{
     job::Pause,
     jpeg::{self, JpegError},
+    keepalive::Elapsed,
     scan::Side,
 };
 
@@ -23,14 +24,36 @@ const ANY_PORT: u16 = 0;
 const DISCARD_PORT: u16 = 9;
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Default)]
-pub struct SleepingClock;
+/// Sleeps through each pause and reads the time elapsed since its creation from the monotonic clock.
+#[derive(Debug)]
+pub struct SleepingClock {
+    start: Instant,
+}
+
+impl SleepingClock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Default for SleepingClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Clock for SleepingClock {
     fn wait(&mut self, pause: Pause) {
         match pause {
             Pause::NoDataYet | Pause::Busy => thread::sleep(RETRY_INTERVAL),
         }
+    }
+
+    fn now(&mut self) -> Elapsed {
+        Elapsed::from_millis(u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 }
 
@@ -98,6 +121,16 @@ impl UdpPort {
         socket.set_broadcast(true)?;
         socket.set_read_timeout(Some(deadline))?;
         Ok(Self(socket))
+    }
+
+    /// Turns the port into one whose receive returns at once, for keepalive ticks between commands.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket can't change its mode.
+    pub fn into_nonblocking(self) -> io::Result<Self> {
+        self.0.set_nonblocking(true)?;
+        Ok(self)
     }
 }
 

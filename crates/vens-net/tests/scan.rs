@@ -1,16 +1,24 @@
 //! Drives the pure job over a scripted stream with the replies of section 8.1 of the ix1300-wifi protocol document.
+//! The keepalive cadence during a long job follows sections 5.1 and 5.3.
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    net::{Ipv4Addr, SocketAddrV4},
+};
 
 use vens_core::{
     Ipv4Address, MacAddress,
+    discovery::Probe,
     job::{JobError, Pause, Summary},
+    keepalive::Elapsed,
     scan::Side,
     sense::Condition,
 };
 use vens_net::{
     channel::{ChannelError, CommandChannel, Stream},
+    keepalive::{DatagramKeepalive, Keepalive},
     scan::{Clock, PageSink, ScanError, run},
+    search::Datagram,
 };
 
 const HOST: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
@@ -45,12 +53,73 @@ impl Stream for Wire {
     }
 }
 
-#[derive(Default)]
-struct Pauses(Vec<Pause>);
+/// Advances a fixed step on every pause, so the elapsed time is part of the script.
+struct Virtual {
+    pauses: Vec<Pause>,
+    now: u64,
+    step: u64,
+}
 
-impl Clock for Pauses {
+impl Virtual {
+    const fn stepping(step: u64) -> Self {
+        Self {
+            pauses: Vec::new(),
+            now: 0,
+            step,
+        }
+    }
+}
+
+impl Clock for Virtual {
     fn wait(&mut self, pause: Pause) {
-        self.0.push(pause);
+        self.pauses.push(pause);
+        self.now = self.now.saturating_add(self.step);
+    }
+
+    fn now(&mut self) -> Elapsed {
+        Elapsed::from_millis(self.now)
+    }
+}
+
+#[derive(Default)]
+struct Ticks(Vec<u64>);
+
+impl Keepalive for Ticks {
+    fn tick(&mut self, now: Elapsed) {
+        self.0.push(now.millis());
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Down;
+
+/// Answers every keepalive probe at once, as a scanner does for the host that holds the reserve.
+#[derive(Default)]
+struct Air {
+    inbox: VecDeque<Vec<u8>>,
+    sent: usize,
+}
+
+impl Datagram for Air {
+    type Error = Down;
+
+    fn send(&mut self, _: &[u8], _: SocketAddrV4) -> Result<(), Down> {
+        let mut answer = b"VENS".to_vec();
+        answer.extend_from_slice(&[0x80, 0x01]);
+        answer.resize(12, 0);
+        self.inbox.push_back(answer);
+        self.sent = self.sent.saturating_add(1);
+        Ok(())
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<usize>, Down> {
+        Ok(self.inbox.pop_front().map(|datagram| {
+            buffer
+                .iter_mut()
+                .zip(&datagram)
+                .for_each(|(slot, byte)| *slot = *byte);
+            datagram.len().min(buffer.len())
+        }))
     }
 }
 
@@ -139,36 +208,103 @@ fn setup() -> Vec<Vec<u8>> {
 
 type Outcome = Result<Summary, ScanError<Closed, Full>>;
 
-fn scan(replies: &[Vec<u8>], capacity: Option<usize>) -> Option<(Outcome, Vec<Pause>, Vec<Page>)> {
+fn drive(
+    replies: &[Vec<u8>],
+    capacity: Option<usize>,
+    clock: &mut Virtual,
+    keepalive: &mut impl Keepalive,
+) -> Option<(Outcome, Vec<Page>)> {
     let wire = Wire(replies.iter().flatten().copied().collect());
     let mut channel = CommandChannel::open(wire, HOST_MAC, HOST).ok()?;
-    let mut clock = Pauses::default();
     let mut pages = Pages {
         seen: Vec::new(),
         capacity,
     };
     let mut buffer = [0_u8; 64];
-    let outcome = run(&mut channel, &mut clock, &mut pages, &mut buffer);
-    Some((outcome, clock.0, pages.seen))
+    let outcome = run(&mut channel, clock, keepalive, &mut pages, &mut buffer);
+    Some((outcome, pages.seen))
 }
 
-fn one_sheet() -> Vec<Vec<u8>> {
-    let mut replies = setup();
-    replies.extend([
+fn scan(replies: &[Vec<u8>], capacity: Option<usize>) -> Option<(Outcome, Vec<Pause>, Vec<Page>)> {
+    let mut clock = Virtual::stepping(0);
+    let (outcome, pages) = drive(replies, capacity, &mut clock, &mut Ticks::default())?;
+    Some((outcome, clock.pauses, pages))
+}
+
+fn sheet(front: &[u8], back: &[u8]) -> Vec<Vec<u8>> {
+    [
         frame(GOOD, &[]),
         frame(CHECK, &[]),
         frame(GOOD, &sense(NO_DATA_YET)),
-        frame(CHECK, &[0, 0, 0xFF, 0xD8, 0xAA]),
+        frame(CHECK, front),
         frame(GOOD, &sense(END_OF_SIDE)),
         frame(GOOD, &pixel_size(9856)),
-        frame(CHECK, &[1, 0, 0xFF, 0xD8]),
+        frame(CHECK, back),
         frame(GOOD, &sense(END_OF_SIDE)),
         frame(GOOD, &pixel_size(9000)),
+    ]
+    .to_vec()
+}
+
+fn end() -> Vec<Vec<u8>> {
+    [
         frame(CHECK, &[]),
         frame(GOOD, &sense(NO_PAPER)),
         frame(GOOD, &[]),
-    ]);
+    ]
+    .to_vec()
+}
+
+fn one_sheet() -> Vec<Vec<u8>> {
+    [
+        setup(),
+        sheet(&[0, 0, 0xFF, 0xD8, 0xAA], &[1, 0, 0xFF, 0xD8]),
+        end(),
+    ]
+    .concat()
+}
+
+fn stack(sheets: u8) -> Vec<Vec<u8>> {
+    let mut replies = setup();
+    for index in 0..sheets {
+        let front = index.saturating_mul(2);
+        replies.extend(sheet(
+            &[front, 0, 0xFF, 0xD8],
+            &[front.saturating_add(1), 0, 0xFF, 0xD8],
+        ));
+    }
+    replies.extend(end());
     replies
+}
+
+#[test]
+fn the_keepalive_ticks_before_every_command_with_the_elapsed_time() {
+    let mut clock = Virtual::stepping(1000);
+    let mut ticks = Ticks::default();
+    let outcome = drive(&one_sheet(), None, &mut clock, &mut ticks).map(|(outcome, _)| outcome);
+    let expected: Vec<u64> = [[0; 8].as_slice(), &[1000; 9]].concat();
+    assert_eq!(
+        (outcome, ticks.0),
+        (Some(Ok(Summary { sheets: 1 })), expected)
+    );
+}
+
+#[test]
+fn a_long_stack_sends_one_keepalive_in_each_round_to_a_scanner_that_answers() {
+    let mut clock = Virtual::stepping(5000);
+    let mut keepalive = DatagramKeepalive::new(
+        Air::default(),
+        Probe::keepalive(HOST, HOST_MAC),
+        SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), 52217),
+        Elapsed::from_millis(0),
+    );
+    let outcome = drive(&stack(8), None, &mut clock, &mut keepalive).map(|(outcome, _)| outcome);
+    let replies = keepalive.replies();
+    let (air, failure) = keepalive.into_parts();
+    assert_eq!(
+        (outcome, clock.now, air.sent, replies, failure),
+        (Some(Ok(Summary { sheets: 8 })), 40_000, 3, 3, None)
+    );
 }
 
 #[test]

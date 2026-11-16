@@ -18,7 +18,9 @@ use vens_net::{
     channel::{ChannelError, CommandChannel},
     control::{ControlChannel, ControlError},
     host::{DirectorySink, SinkError, SleepingClock, TcpPort, UdpPort, local_address_toward},
+    keepalive::DatagramKeepalive,
     record::Recorder,
+    scan::Clock,
     search::{SearchError, search},
     session::{Host, SessionError, scan_once},
     trace::{self, Channel, Event},
@@ -147,17 +149,33 @@ fn scan(
             let stream = Recorder::new(stream, Channel::Control, events.clone());
             ControlChannel::open(stream).map_err(Failure::Control)
         })?;
+    let mut clock = SleepingClock::new();
+    let keepalive_port = discovery
+        .into_port()
+        .into_nonblocking()
+        .map_err(Failure::Io)?;
+    let mut keepalive = DatagramKeepalive::new(
+        Recorder::new(keepalive_port, Channel::Discovery, events.clone()),
+        Probe::keepalive(address, HOST_MAC),
+        SocketAddrV4::new(scanner_address, DISCOVERY_PORT),
+        clock.now(),
+    );
     let mut sink = DirectorySink::new(arguments.directory.clone());
     let mut buffer = vec![0_u8; REPLY_CAPACITY];
-    let summary = scan_once(
+    let outcome = scan_once(
         &mut command,
         &mut control,
+        &mut keepalive,
         host,
-        &mut SleepingClock,
+        &mut clock,
         &mut sink,
         &mut buffer,
-    )
-    .map_err(Failure::Session)?;
+    );
+    writeln!(out, "keepalive replies: {}", keepalive.replies()).map_err(Failure::Io)?;
+    if let (_, Some(error)) = keepalive.into_parts() {
+        writeln!(out, "keepalive failure: {error}").map_err(Failure::Io)?;
+    }
+    let summary = outcome.map_err(Failure::Session)?;
     writeln!(out, "sheets: {}", summary.sheets).map_err(Failure::Io)?;
     sink.written()
         .iter()

@@ -13,6 +13,7 @@ use vens_core::{
     discovery::{Probe, SearchReply},
     job::{Pause, Summary},
     jpeg::{self, FrameSize, JpegError, frame_size},
+    keepalive::Elapsed,
     scan::Side,
 };
 use vens_emulator::{
@@ -24,6 +25,7 @@ use vens_emulator::{
 use vens_net::{
     channel::{ChannelError, CommandChannel},
     control::ControlChannel,
+    keepalive::Idle,
     record::Recorder,
     scan::{Clock, PageSink},
     search::search,
@@ -45,6 +47,10 @@ struct Pauses(Vec<Pause>);
 impl Clock for Pauses {
     fn wait(&mut self, pause: Pause) {
         self.0.push(pause);
+    }
+
+    fn now(&mut self) -> Elapsed {
+        Elapsed::from_millis(0)
     }
 }
 
@@ -112,6 +118,7 @@ fn replay(host_address: [u8; 4]) -> Option<Replayed> {
     let outcome = scan_once(
         &mut command,
         &mut control,
+        &mut Idle,
         host,
         &mut pauses,
         &mut images,

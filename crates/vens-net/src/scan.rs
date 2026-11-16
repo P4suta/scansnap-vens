@@ -1,12 +1,19 @@
 use vens_core::{
     job::{JobError, Pause, Step, Summary, start},
+    keepalive::Elapsed,
     scan::Side,
 };
 
-use crate::channel::{ChannelError, CommandChannel, Stream};
+use crate::{
+    channel::{ChannelError, CommandChannel, Stream},
+    keepalive::Keepalive,
+};
 
 pub trait Clock {
     fn wait(&mut self, pause: Pause);
+
+    /// Reads a monotonic clock.
+    fn now(&mut self) -> Elapsed;
 }
 
 pub trait PageSink {
@@ -32,12 +39,15 @@ pub enum ScanError<P, K> {
 
 /// Runs one scan job to its end and hands every image byte to the sink.
 ///
+/// The keepalive ticks before every command with the time that the clock reads at that moment.
+///
 /// # Errors
 ///
 /// Fails when the command channel fails, the sink fails, or the job ends with an error.
-pub fn run<S: Stream, C: Clock, K: PageSink>(
+pub fn run<S: Stream, C: Clock, A: Keepalive, K: PageSink>(
     channel: &mut CommandChannel<S>,
     clock: &mut C,
+    keepalive: &mut A,
     sink: &mut K,
     buffer: &mut [u8],
 ) -> Result<Summary, ScanError<S::Error, K::Error>> {
@@ -45,6 +55,7 @@ pub fn run<S: Stream, C: Clock, K: PageSink>(
     loop {
         step = match step {
             Step::Execute(awaiting) => {
+                keepalive.tick(clock.now());
                 let reply = channel
                     .execute(&awaiting.command(), buffer)
                     .map_err(ScanError::Channel)?;

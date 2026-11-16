@@ -5,7 +5,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use vens_net::{
@@ -78,6 +78,19 @@ fn silent_stream() -> io::Result<io::ErrorKind> {
         Ok(()) => Err(io::Error::other("a silent peer delivered a byte")),
         Err(error) => Ok(error.kind()),
     }
+}
+
+fn nonblocking_silence() -> io::Result<(Option<usize>, bool)> {
+    let mut port = UdpPort::open(Duration::from_secs(60))?.into_nonblocking()?;
+    let mut buffer = [0; 16];
+    let started = Instant::now();
+    let silence = port.receive(&mut buffer)?;
+    Ok((silence, started.elapsed() < GENEROUS))
+}
+
+#[test]
+fn a_nonblocking_datagram_port_reports_silence_at_once() {
+    assert_eq!(nonblocking_silence().ok(), Some((None, true)));
 }
 
 #[test]

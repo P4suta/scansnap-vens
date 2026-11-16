@@ -10,6 +10,7 @@ use vens_core::{
 use crate::{
     channel::{ChannelError, CommandChannel, Stream},
     control::{ControlChannel, ControlError},
+    keepalive::Keepalive,
     scan::{Clock, PageSink, ScanError, run},
 };
 
@@ -62,9 +63,10 @@ fn registered_host<S: Stream, K>(
 ///
 /// Fails when the identifier can't be read, the reserve is refused, the job fails, or the release is refused.
 /// A job failure carries the release outcome, and a release failure after a good job carries the job summary.
-pub fn scan_once<S, T, C, K>(
+pub fn scan_once<S, T, A, C, K>(
     command: &mut CommandChannel<S>,
     control: &mut ControlChannel<T>,
+    keepalive: &mut A,
     host: Host,
     clock: &mut C,
     sink: &mut K,
@@ -73,6 +75,7 @@ pub fn scan_once<S, T, C, K>(
 where
     S: Stream,
     T: Stream<Error = S::Error>,
+    A: Keepalive,
     C: Clock,
     K: PageSink,
 {
@@ -88,7 +91,7 @@ where
             offset: UtcOffset::from_seconds(0),
         })
         .map_err(SessionError::Reserve)?;
-    let scanned = run(command, clock, sink, buffer);
+    let scanned = run(command, clock, keepalive, sink, buffer);
     let released = control.release(Release::new(host.mac));
     match (scanned, released) {
         (Ok(summary), Ok(())) => Ok(summary),
