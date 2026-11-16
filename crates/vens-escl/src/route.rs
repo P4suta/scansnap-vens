@@ -15,6 +15,11 @@ impl JobPath {
     pub const fn new(job: Uuid) -> Self {
         Self(job)
     }
+
+    #[must_use]
+    pub const fn job(self) -> Uuid {
+        self.0
+    }
 }
 
 impl fmt::Display for JobPath {
