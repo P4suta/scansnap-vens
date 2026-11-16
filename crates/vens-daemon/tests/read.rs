@@ -74,8 +74,18 @@ fn request(method: &str, target: &str, body: &[u8]) -> HttpRequest {
     HttpRequest {
         method: method.to_owned(),
         target: target.to_owned(),
+        user_agent: None,
         body: body.to_vec(),
     }
+}
+
+#[test]
+fn the_user_agent_names_the_client() {
+    assert_eq!(
+        read(b"GET /eSCL/ScannerStatus HTTP/1.1\r\nuser-agent: AirScanScanner/58\r\n\r\n")
+            .map(|request| request.user_agent),
+        Ok(Some("AirScanScanner/58".to_owned()))
+    );
 }
 
 #[test]

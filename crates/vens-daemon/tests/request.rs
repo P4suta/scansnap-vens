@@ -17,6 +17,7 @@ fn http(method: &str, target: &str, body: &str) -> HttpRequest {
     HttpRequest {
         method: method.to_owned(),
         target: target.to_owned(),
+        user_agent: None,
         body: body.as_bytes().to_vec(),
     }
 }
@@ -127,6 +128,7 @@ fn an_unreadable_settings_body_is_malformed() {
     let not_utf8 = HttpRequest {
         method: "POST".to_owned(),
         target: "/eSCL/ScanJobs".to_owned(),
+        user_agent: None,
         body: [0xFF, 0xFE, 0x3C].to_vec(),
     };
     assert_eq!(

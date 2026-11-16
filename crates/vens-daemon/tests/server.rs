@@ -260,6 +260,65 @@ fn a_silent_connection_times_out_while_other_clients_get_answers() {
     assert_eq!(checks, Some((200, Vec::new())));
 }
 
+/// Reads log lines until one matches, and returns every line read.
+fn lines_until(log: &mpsc::Receiver<String>, wanted: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Ok(line) = log.recv_timeout(Duration::from_secs(10)) {
+        let found = wanted(&line);
+        lines.push(line);
+        if found {
+            break;
+        }
+    }
+    lines
+}
+
+#[test]
+fn a_refused_job_request_logs_its_reason_client_and_body() {
+    let body = SETTINGS.replace("RGB24", "Grayscale8");
+    let lines = start(Vec::new()).and_then(|(port, log)| {
+        exchange(
+            port,
+            format!(
+                "POST /eSCL/ScanJobs HTTP/1.1\r\nUser-Agent: AirScanScanner/58\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )?;
+        Some(lines_until(&log, |line| line.contains("Grayscale8")))
+    });
+    assert_eq!(
+        lines.map(|lines| (
+            lines
+                .iter()
+                .any(|line| line.ends_with("POST /eSCL/ScanJobs 409 Unsupported(ColorMode)")),
+            lines
+                .iter()
+                .any(|line| line.contains("AirScanScanner/58") && line.contains("Grayscale8")),
+        )),
+        Some((true, true))
+    );
+}
+
+#[test]
+fn each_page_logs_its_size_and_component_count() {
+    let pages = start([events(ONE_SHEET)].to_vec()).and_then(|(port, log)| {
+        let created = post(port, "/eSCL/ScanJobs", SETTINGS)?;
+        let next = format!("{}/NextDocument", created.field("location")?);
+        get(port, &next)?;
+        get(port, &next)?;
+        let lines = lines_until(&log, |line| line.starts_with("page Back"));
+        Some(
+            lines
+                .into_iter()
+                .filter(|line| line.starts_with("page "))
+                .map(|line| line.ends_with(", components 1") && line.contains('x'))
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(pages, Some([true, true].to_vec()));
+}
+
 #[test]
 fn the_log_names_each_request_with_its_status() {
     let line = start(Vec::new()).and_then(|(port, log)| {

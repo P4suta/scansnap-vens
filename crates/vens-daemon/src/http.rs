@@ -21,6 +21,8 @@ pub struct Limits {
 pub struct HttpRequest {
     pub method: String,
     pub target: String,
+    /// The client's `User-Agent` field, which the log shows beside a refused job request.
+    pub user_agent: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -39,6 +41,7 @@ pub enum ReadError {
 struct Head {
     method: String,
     target: String,
+    user_agent: Option<String>,
     framing: Framing,
     expects_continue: bool,
     length: usize,
@@ -70,12 +73,18 @@ fn parse_head(bytes: &[u8]) -> Result<Option<Head>, ReadError> {
             header.name.eq_ignore_ascii_case("expect")
                 && header.value.eq_ignore_ascii_case(b"100-continue")
         });
+    let user_agent = request
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("user-agent"))
+        .map(|header| String::from_utf8_lossy(header.value).into_owned());
     let (Some(method), Some(target)) = (request.method, request.path) else {
         return Err(ReadError::Malformed);
     };
     Ok(Some(Head {
         method: method.to_owned(),
         target: target.to_owned(),
+        user_agent,
         framing,
         expects_continue,
         length,
@@ -233,6 +242,7 @@ pub fn read_request<S: Read + Write>(
     Ok(HttpRequest {
         method: head.method,
         target: head.target,
+        user_agent: head.user_agent,
         body,
     })
 }

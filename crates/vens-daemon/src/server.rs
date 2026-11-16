@@ -6,8 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use vens_core::jpeg::{components, frame_size};
 use vens_escl::{
-    bridge::{Bridge, Effect, Input, Moment, Refusal, Request, Response},
+    bridge::{Bridge, Effect, Input, Moment, Refusal, Request, Response, Side},
     uuid::Uuid,
 };
 use vens_net::network::Network;
@@ -24,6 +25,8 @@ const ACCEPTORS: usize = 4;
 const QUEUE: usize = 256;
 /// The pause after a failed accept, so a lasting failure doesn't spin.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// The characters of a job request body that the log keeps.
+const BODY_EXCERPT: usize = 2048;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -50,6 +53,8 @@ pub trait Log {
 
 struct Responder {
     line: String,
+    /// The client and body of a job request, which the log shows when the bridge refuses it.
+    detail: Option<String>,
     reply: Sender<Response<Vec<u8>>>,
 }
 
@@ -98,12 +103,29 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
         }
     };
     let (reply, answers) = mpsc::channel();
+    let escl = escl_request(&request);
+    let detail = matches!(escl, Request::CreateJob(_) | Request::Malformed).then(|| {
+        let body: String = String::from_utf8_lossy(&request.body)
+            .chars()
+            .take(BODY_EXCERPT)
+            .collect();
+        format!(
+            "client {:?}, body {body:?}",
+            request.user_agent.as_deref().unwrap_or("unnamed")
+        )
+    });
     let responder = Responder {
         line: format!("{peer} {} {}", request.method, request.target),
+        detail,
         reply,
     };
-    let request = escl_request(&request);
-    if events.send(Event::Request { request, responder }).is_err() {
+    if events
+        .send(Event::Request {
+            request: escl,
+            responder,
+        })
+        .is_err()
+    {
         return;
     }
     let Ok(response) = answers.recv() else {
@@ -148,6 +170,33 @@ fn start_job<'scope, S: Networks>(
     }
 }
 
+fn page_line(side: Side, page: &[u8]) -> String {
+    match (frame_size(page), components(page)) {
+        (Ok(frame), Ok(count)) => format!(
+            "page {side:?}: {}x{}, components {count}",
+            frame.width, frame.height
+        ),
+        (Err(error), _) | (Ok(_), Err(error)) => {
+            format!("page {side:?}: unreadable frame header {error:?}")
+        }
+    }
+}
+
+fn reason<P>(response: &Response<P>) -> String {
+    match response {
+        Response::Conflict(conflict) => format!(" {conflict:?}"),
+        Response::Unavailable(unavailable) => format!(" {unavailable:?}"),
+        Response::Capabilities(_)
+        | Response::Status(_)
+        | Response::Created(_)
+        | Response::Page(_)
+        | Response::Deleted
+        | Response::NotFound
+        | Response::MethodNotAllowed(_)
+        | Response::BadRequest => String::new(),
+    }
+}
+
 fn input<L: Log>(event: Event, log: &mut L) -> Option<Input<Responder, Vec<u8>>> {
     match event {
         Event::Request { request, responder } => Some(Input::Request { request, responder }),
@@ -159,7 +208,10 @@ fn input<L: Log>(event: Event, log: &mut L) -> Option<Input<Responder, Vec<u8>>>
             log.record(&format!("job refused: {refusal:?} ({detail})"));
             Some(Input::Refused(refusal))
         }
-        Event::Job(JobEvent::Page { side, page }) => Some(Input::Page { side, page }),
+        Event::Job(JobEvent::Page { side, page }) => {
+            log.record(&page_line(side, &page));
+            Some(Input::Page { side, page })
+        }
         Event::Job(JobEvent::Finished { ending, detail }) => {
             let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
             log.record(&format!("job finished: {ending:?}{detail}"));
@@ -195,7 +247,10 @@ fn own<'scope, S: Networks, L: Log>(
                     response,
                 } => {
                     let (code, _) = status(&response);
-                    log.record(&format!("{} {code}", responder.line));
+                    log.record(&format!("{} {code}{}", responder.line, reason(&response)));
+                    if let (400..=599, Some(detail)) = (code, &responder.detail) {
+                        log.record(&format!("{} {detail}", responder.line));
+                    }
                     let _ = responder.reply.send(response);
                 }
                 Effect::Start(_) => start_job(scope, networks, config.target, events),
