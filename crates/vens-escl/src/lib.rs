@@ -2,6 +2,7 @@
 
 #![no_std]
 
+pub mod document;
 pub mod route;
 pub mod settings;
 pub mod uuid;
