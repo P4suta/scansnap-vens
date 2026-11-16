@@ -8,9 +8,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use vens_core::Ipv4Address;
 use vens_net::{
     channel::Stream,
-    host::{TcpPort, UdpPort, local_address_toward},
+    host::{SystemNetwork, TcpPort, UdpPort, local_address_toward},
+    network::{Connection, Network},
     search::Datagram,
 };
 
@@ -86,6 +88,46 @@ fn nonblocking_silence() -> io::Result<(Option<usize>, bool)> {
     let started = Instant::now();
     let silence = port.receive(&mut buffer)?;
     Ok((silence, started.elapsed() < GENEROUS))
+}
+
+type SystemRound = (Ipv4Address, bool, bool, Option<usize>, bool, bool);
+
+fn system_network_round() -> io::Result<SystemRound> {
+    let mut network = SystemNetwork::new(SHORT, GENEROUS);
+    let local = network.local_address(Ipv4Addr::LOCALHOST)?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = loopback(listener.local_addr()?)?;
+    let stream = network.connect(endpoint, Connection::Command);
+    let (_trigger, port) = network.open_trigger(local)?;
+    let time = network.local_time();
+    let discovery = network.open_discovery()?;
+    let mut keepalive = network.keepalive(discovery)?;
+    let mut buffer = [0; 8];
+    let started = Instant::now();
+    let silence = keepalive.receive(&mut buffer)?;
+    Ok((
+        local,
+        stream.is_ok(),
+        port.number() != 0,
+        silence,
+        started.elapsed() < GENEROUS,
+        time.is_ok(),
+    ))
+}
+
+#[test]
+fn the_system_network_opens_real_ports_on_loopback() {
+    assert_eq!(
+        system_network_round().ok(),
+        Some((
+            Ipv4Address::new([127, 0, 0, 1]),
+            true,
+            true,
+            None,
+            true,
+            true
+        ))
+    );
 }
 
 #[test]

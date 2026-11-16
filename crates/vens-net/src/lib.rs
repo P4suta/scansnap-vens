@@ -2,6 +2,7 @@ pub mod channel;
 pub mod control;
 pub mod host;
 pub mod keepalive;
+pub mod network;
 pub mod record;
 pub mod scan;
 pub mod search;

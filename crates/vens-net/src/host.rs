@@ -4,10 +4,12 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
     path::PathBuf,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use vens_core::{
+    Ipv4Address, Port,
+    control::LocalTime,
     job::Pause,
     jpeg::{self, JpegError},
     keepalive::Elapsed,
@@ -16,6 +18,7 @@ use vens_core::{
 
 use crate::{
     channel::Stream,
+    network::{Connection, Network},
     scan::{Clock, PageSink},
     search::Datagram,
 };
@@ -23,6 +26,7 @@ use crate::{
 const ANY_PORT: u16 = 0;
 const DISCARD_PORT: u16 = 9;
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const ROUTE_PROBE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 
 /// Sleeps through each pause and reads the time elapsed since its creation from the monotonic clock.
 #[derive(Debug)]
@@ -196,5 +200,76 @@ pub fn local_address_toward(target: Ipv4Addr) -> io::Result<Ipv4Addr> {
     match socket.local_addr()? {
         SocketAddr::V4(address) => Ok(*address.ip()),
         SocketAddr::V6(_) => Err(io::Error::other("the selected local address isn't IPv4")),
+    }
+}
+
+/// Reaches the scanner through the sockets, the routing table, and the clocks of this host.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemNetwork {
+    probe_interval: Duration,
+    deadline: Duration,
+}
+
+impl SystemNetwork {
+    /// Waits `probe_interval` for each discovery reply and `deadline` for each connection and transfer.
+    #[must_use]
+    pub const fn new(probe_interval: Duration, deadline: Duration) -> Self {
+        Self {
+            probe_interval,
+            deadline,
+        }
+    }
+}
+
+impl Network for SystemNetwork {
+    type Error = io::Error;
+    type Discovery = UdpPort;
+    type Keepalive = UdpPort;
+    type Stream = TcpPort;
+    type Trigger = UdpSocket;
+    type Clock = SleepingClock;
+
+    fn local_address(&mut self, target: Ipv4Addr) -> io::Result<Ipv4Address> {
+        let route = if target.is_broadcast() {
+            ROUTE_PROBE
+        } else {
+            target
+        };
+        local_address_toward(route).map(|address| Ipv4Address::new(address.octets()))
+    }
+
+    fn open_discovery(&mut self) -> io::Result<UdpPort> {
+        UdpPort::open(self.probe_interval)
+    }
+
+    fn keepalive(&mut self, discovery: UdpPort) -> io::Result<UdpPort> {
+        discovery.into_nonblocking()
+    }
+
+    fn open_trigger(&mut self, local: Ipv4Address) -> io::Result<(UdpSocket, Port)> {
+        let socket = UdpSocket::bind((Ipv4Addr::from(local.octets()), ANY_PORT))?;
+        match socket.local_addr()? {
+            SocketAddr::V4(address) => {
+                let port = Port::new(address.port());
+                Ok((socket, port))
+            }
+            SocketAddr::V6(_) => Err(io::Error::other("the trigger socket isn't IPv4")),
+        }
+    }
+
+    fn connect(&mut self, endpoint: SocketAddrV4, _: Connection) -> io::Result<TcpPort> {
+        TcpPort::connect(endpoint, self.deadline)
+    }
+
+    fn local_time(&mut self) -> io::Result<LocalTime> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| LocalTime::from_unix_seconds(elapsed.as_secs()))
+            .ok_or_else(|| io::Error::other("the system clock is outside the supported range"))
+    }
+
+    fn clock(&mut self) -> SleepingClock {
+        SleepingClock::new()
     }
 }
