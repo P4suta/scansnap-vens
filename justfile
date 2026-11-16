@@ -15,5 +15,8 @@ fmt:
 vens *arguments:
     cargo run --locked -p vens-cli -- {{ arguments }}
 
+vensd *arguments:
+    cargo run --locked -p vens-daemon --bin vensd -- {{ arguments }}
+
 redact-capture raw fixture:
     cargo run --locked -p xtask -- redact-capture {{ quote(raw) }} {{ quote(fixture) }}
