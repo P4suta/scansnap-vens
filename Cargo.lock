@@ -46,7 +46,10 @@ version = "0.0.0"
 dependencies = [
  "httparse",
  "roxmltree",
+ "vens-core",
+ "vens-emulator",
  "vens-escl",
+ "vens-net",
 ]
 
 [[package]]
