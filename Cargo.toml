@@ -2,6 +2,7 @@
 members = [
   "crates/vens-core",
   "crates/vens-net",
+  "fixtures/emulator",
   "verification/lint-fixtures",
   "xtask",
 ]
@@ -15,6 +16,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 vens-core = { path = "crates/vens-core", version = "0.0.0" }
+vens-net = { path = "crates/vens-net", version = "0.0.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
