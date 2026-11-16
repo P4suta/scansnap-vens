@@ -1,10 +1,11 @@
 //! The correction follows section 8.4 of the ix1300-wifi protocol document.
 //! The marker segments and the frame header follow annex B of ITU-T T.81.
 
-use vens_core::jpeg::{FrameSize, JpegError, frame_size, set_height};
+use vens_core::jpeg::{FrameSize, JpegError, components, frame_size, set_height};
 
 const HEIGHT_OFFSET: usize = 18;
 const WIDTH_END: usize = 22;
+const COMPONENTS: usize = 22;
 
 fn image(frame_marker: u8) -> [u8; 34] {
     [
@@ -128,6 +129,28 @@ fn the_frame_size_of_an_image_cut_before_the_width_is_refused_at_every_length() 
     for length in 2..WIDTH_END {
         assert_eq!(
             frame_size(bytes.get(..length).unwrap_or_default()),
+            Err(JpegError::Truncated)
+        );
+    }
+}
+
+#[test]
+fn the_component_count_comes_from_the_frame_header() {
+    assert_eq!(
+        [
+            components(&image(0xC0)),
+            components(&replaced(image(0xC2), COMPONENTS, &[0x03])),
+        ],
+        [Ok(1), Ok(3)]
+    );
+}
+
+#[test]
+fn the_component_count_of_an_image_cut_before_it_is_refused_at_every_length() {
+    let bytes = image(0xC0);
+    for length in 2..=COMPONENTS {
+        assert_eq!(
+            components(bytes.get(..length).unwrap_or_default()),
             Err(JpegError::Truncated)
         );
     }

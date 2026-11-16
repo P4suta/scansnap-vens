@@ -10,6 +10,7 @@ const MARKER_LENGTH: usize = 2;
 const LENGTH_FIELD: usize = 2;
 const HEIGHT_IN_FRAME: usize = 5;
 const WIDTH_AFTER_HEIGHT: usize = 2;
+const COMPONENTS_AFTER_HEIGHT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JpegError {
@@ -77,6 +78,20 @@ pub fn frame_size(image: &[u8]) -> Result<FrameSize, JpegError> {
         height: read(height)?,
         width: read(width)?,
     })
+}
+
+/// Reads the number of image components from the frame header of a JPEG image: one for gray and three for color.
+///
+/// # Errors
+///
+/// Refuses bytes that don't start an image, end before the count, break the marker segment structure, or reach the scan without a frame header.
+pub fn components(image: &[u8]) -> Result<u8, JpegError> {
+    let offset = height_offset(image)?
+        .checked_add(COMPONENTS_AFTER_HEIGHT)
+        .ok_or(JpegError::Truncated)?;
+    field(image, offset)
+        .map(|[count]| count)
+        .ok_or(JpegError::Truncated)
 }
 
 /// Writes `height` into the frame header of a JPEG image.
