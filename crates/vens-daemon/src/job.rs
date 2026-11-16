@@ -83,13 +83,10 @@ fn ending<E: Debug>(run: JobRun<E, JpegError>) -> (Ending, Option<String>) {
             Some(format!("release failed: {failure:?}")),
         ),
         Err(JobFailure::Scan { failure, release }) => {
-            let fault = if matches!(
-                failure,
-                ScanError::Job(JobError::Condition(Condition::PaperJam))
-            ) {
-                Fault::Jam
-            } else {
-                Fault::Scanner
+            let fault = match failure {
+                ScanError::Job(JobError::Condition(Condition::PaperJam)) => Fault::Jam,
+                ScanError::Job(JobError::Condition(Condition::DoubleFeed)) => Fault::DoubleFeed,
+                ScanError::Channel(_) | ScanError::Sink(_) | ScanError::Job(_) => Fault::Scanner,
             };
             (
                 Ending::Failed(fault),

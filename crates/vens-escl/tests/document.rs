@@ -304,7 +304,13 @@ fn each_ending_job_state_renders_its_state_and_reason() {
 
 #[test]
 fn each_feeder_state_renders_its_name() {
-    let rendered = [AdfState::Loaded, AdfState::Empty, AdfState::Jam].map(|adf| {
+    let rendered = [
+        AdfState::Loaded,
+        AdfState::Empty,
+        AdfState::Jam,
+        AdfState::MultipickDetected,
+    ]
+    .map(|adf| {
         texts(
             &status(ScannerState::Idle, adf, None),
             &[STATUS, (Scan, "AdfState")],
@@ -316,6 +322,7 @@ fn each_feeder_state_renders_its_name() {
             strings(&["ScannerAdfLoaded"]),
             strings(&["ScannerAdfEmpty"]),
             strings(&["ScannerAdfJam"]),
+            strings(&["ScannerAdfMultipickDetected"]),
         ]
     );
 }

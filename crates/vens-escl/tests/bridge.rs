@@ -449,6 +449,38 @@ fn a_failed_job_delivers_its_pages_and_then_a_conflict() {
 }
 
 #[test]
+fn each_fault_shows_its_feeder_state_after_the_kept_pages() {
+    let faults = [
+        (Fault::Jam, AdfState::Jam),
+        (Fault::DoubleFeed, AdfState::MultipickDetected),
+        (Fault::Scanner, AdfState::Loaded),
+        (Fault::Lost, AdfState::Loaded),
+    ];
+    for (fault, adf) in faults {
+        check(started::<4>(duplex()).map(|(bridge, id)| {
+            let (bridge, mut log) = feed(
+                bridge,
+                [
+                    (2, Input::Finished(Ending::Failed(fault))),
+                    (3, request(Request::NextDocument(id), "failed")),
+                ],
+            );
+            (
+                (log.split_off(1), status_of(&bridge, 4)),
+                (
+                    [reply("failed", Response::Conflict(Conflict::Failed(fault)))].to_vec(),
+                    Some(ScannerStatus {
+                        state: ScannerState::Idle,
+                        adf,
+                        job: Some(info(id, 0, 0, JobState::Aborted)),
+                    }),
+                ),
+            )
+        }));
+    }
+}
+
+#[test]
 fn deleting_a_running_job_answers_its_waiting_request_and_frees_the_bridge_after_the_scan() {
     check(started::<4>(duplex()).map(|(bridge, id)| {
         let (bridge, mut log) = feed(

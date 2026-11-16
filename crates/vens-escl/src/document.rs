@@ -80,6 +80,8 @@ pub enum AdfState {
     Loaded,
     Empty,
     Jam,
+    /// The feeder took more than one sheet at once.
+    MultipickDetected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +120,7 @@ const fn adf_state(adf: AdfState) -> &'static str {
         AdfState::Loaded => "ScannerAdfLoaded",
         AdfState::Empty => "ScannerAdfEmpty",
         AdfState::Jam => "ScannerAdfJam",
+        AdfState::MultipickDetected => "ScannerAdfMultipickDetected",
     }
 }
 

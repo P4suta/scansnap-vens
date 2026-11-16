@@ -42,6 +42,8 @@ pub enum Refusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
     Jam,
+    /// The scanner detected two sheets fed at once.
+    DoubleFeed,
     Scanner,
     /// The page queue was full, so the bridge dropped a page.
     Lost,
@@ -262,6 +264,7 @@ const fn end_of<P>(ending: Ending) -> Response<P> {
 const fn feeder_after(fault: Fault) -> AdfState {
     match fault {
         Fault::Jam => AdfState::Jam,
+        Fault::DoubleFeed => AdfState::MultipickDetected,
         Fault::Scanner | Fault::Lost => AdfState::Loaded,
     }
 }

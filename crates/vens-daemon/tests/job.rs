@@ -162,6 +162,17 @@ fn a_jam_ends_the_job_with_its_fault_after_the_scanned_pages() {
 }
 
 #[test]
+fn a_double_feed_ends_the_job_with_its_fault_after_the_scanned_pages() {
+    assert_eq!(
+        seen(changed(THREE_SHEETS, LAST_SENSE, QUALIFIER, &[0x07])),
+        Some(scanned(
+            3,
+            Seen::Finished(Ending::Failed(Fault::DoubleFeed), true)
+        ))
+    );
+}
+
+#[test]
 fn a_refused_release_after_a_good_scan_keeps_the_pages_and_names_the_refusal() {
     assert_eq!(
         seen(changed(
