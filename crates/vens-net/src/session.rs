@@ -29,8 +29,15 @@ pub enum SessionError<P, K> {
     StatusRefused(ScsiStatus),
     Status(StatusError),
     NotRegistered,
-    Control(ControlError<P>),
-    Scan(ScanError<P, K>),
+    Reserve(ControlError<P>),
+    Scan {
+        failure: ScanError<P, K>,
+        release: Result<(), ControlError<P>>,
+    },
+    Release {
+        summary: Summary,
+        failure: ControlError<P>,
+    },
 }
 
 fn registered_host<S: Stream, K>(
@@ -54,7 +61,7 @@ fn registered_host<S: Stream, K>(
 /// # Errors
 ///
 /// Fails when the identifier can't be read, the reserve is refused, the job fails, or the release is refused.
-/// A job failure takes precedence over a release failure.
+/// A job failure carries the release outcome, and a release failure after a good job carries the job summary.
 pub fn scan_once<S, T, C, K>(
     command: &mut CommandChannel<S>,
     control: &mut ControlChannel<T>,
@@ -80,11 +87,12 @@ where
             host_id,
             offset: UtcOffset::from_seconds(0),
         })
-        .map_err(SessionError::Control)?;
-    let scanned = run(command, clock, sink, buffer).map_err(SessionError::Scan);
-    let released = control
-        .release(Release::new(host.mac))
-        .map_err(SessionError::Control);
-    let summary = scanned?;
-    released.map(|()| summary)
+        .map_err(SessionError::Reserve)?;
+    let scanned = run(command, clock, sink, buffer);
+    let released = control.release(Release::new(host.mac));
+    match (scanned, released) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Ok(summary), Err(failure)) => Err(SessionError::Release { summary, failure }),
+        (Err(failure), release) => Err(SessionError::Scan { failure, release }),
+    }
 }

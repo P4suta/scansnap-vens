@@ -243,7 +243,7 @@ fn a_refused_reserve_ends_the_session_before_any_scan_command() {
     assert_eq!(
         session(&one_sheet(), &control).map(|(outcome, _, sides)| (outcome, sides)),
         Some((
-            Err(SessionError::Control(ControlError::Reserve(
+            Err(SessionError::Reserve(ControlError::Reserve(
                 ReserveRefusal::Occupied
             ))),
             0
@@ -251,32 +251,54 @@ fn a_refused_reserve_ends_the_session_before_any_scan_command() {
     );
 }
 
-#[test]
-fn a_failed_job_still_releases_the_scanner_and_reports_the_job_failure() {
-    let command = job(&[
+fn jammed_job() -> Vec<Vec<u8>> {
+    job(&[
         frame(CHECK, &[]),
         frame(GOOD, &sense([3, 0x80, 0x01])),
         frame(GOOD, &[]),
-    ]);
+    ])
+}
+
+#[test]
+fn a_failed_job_still_releases_the_scanner_and_reports_the_job_failure() {
     let control = [greeting(), control_reply(20, 0), control_reply(16, 0)];
     let sent = expected_reserve()
         .map(|reserve| [reserve.as_slice(), Release::new(MAC).encode().as_slice()].concat());
     assert_eq!(
-        session(&command, &control).map(|(outcome, sent, _)| (outcome, sent)),
+        session(&jammed_job(), &control).map(|(outcome, sent, _)| (outcome, sent)),
         sent.map(|sent| (
-            Err(SessionError::Scan(ScanError::Job(JobError::Condition(
-                Condition::PaperJam
-            )))),
+            Err(SessionError::Scan {
+                failure: ScanError::Job(JobError::Condition(Condition::PaperJam)),
+                release: Ok(()),
+            }),
             sent
         ))
     );
 }
 
 #[test]
-fn a_refused_release_after_a_good_job_is_reported() {
+fn a_failed_job_with_a_refused_release_reports_both_failures() {
+    let control = [greeting(), control_reply(20, 0), control_reply(16, -1)];
+    assert_eq!(
+        session(&jammed_job(), &control).map(|(outcome, _, _)| outcome),
+        Some(Err(SessionError::Scan {
+            failure: ScanError::Job(JobError::Condition(Condition::PaperJam)),
+            release: Err(ControlError::Release(-1)),
+        }))
+    );
+}
+
+#[test]
+fn a_refused_release_after_a_good_job_keeps_the_job_summary() {
     let control = [greeting(), control_reply(20, 0), control_reply(16, -1)];
     assert_eq!(
         session(&one_sheet(), &control).map(|(outcome, _, sides)| (outcome, sides)),
-        Some((Err(SessionError::Control(ControlError::Release(-1))), 2))
+        Some((
+            Err(SessionError::Release {
+                summary: Summary { sheets: 1 },
+                failure: ControlError::Release(-1),
+            }),
+            2
+        ))
     );
 }
