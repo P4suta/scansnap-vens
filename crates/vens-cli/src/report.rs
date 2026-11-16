@@ -1,7 +1,11 @@
-use std::{fmt::Display, path::PathBuf};
+use std::{
+    fmt::Display,
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+};
 
 use vens_core::{
-    command::ScsiStatus,
+    command::{ReplyHeaderError, ScsiStatus},
     control::{GreetingError, ReserveRefusal},
     discovery::{Availability, Password, SearchReply},
     job::{JobError, Pause},
@@ -9,7 +13,7 @@ use vens_core::{
     status::PaperPath,
 };
 use vens_net::{
-    channel::ChannelError, control::ControlError, scan::ScanError, search::SearchError,
+    channel::ChannelError, control::ControlError, network::Connection, scan::ScanError,
     session::SessionError,
 };
 
@@ -25,7 +29,8 @@ const USAGE: &str = "usage: vens <subcommand> [options]
   vens status [--address <ipv4>]
       show the identity, the paper path, and the registered host
   vens scan <folder> [--address <ipv4>] [--trace <file>]
-      scan the stack in the top chute into the folder, one image for each side
+      scan the stack in the top chute into a new subfolder of the folder,
+      one image for each side
   vens help
       show this text
 
@@ -61,7 +66,6 @@ fn text(field: Option<&str>) -> &str {
 /// Shows the identity and the endpoints of a scanner from its search reply.
 #[must_use]
 pub fn found(reply: &SearchReply) -> String {
-    let address = reply.address().octets();
     let device_status = match reply.availability() {
         Availability::Ready => "0".to_owned(),
         Availability::Busy => "2 (busy)".to_owned(),
@@ -72,13 +76,10 @@ pub fn found(reply: &SearchReply) -> String {
         Password::Required => "required, which vens doesn't support yet",
     };
     format!(
-        "scanner: {} ({})\naddress: {}.{}.{}.{}\nports: command {}, control {}\ndevice status: {device_status}\npassword: {password}\n",
+        "scanner: {} ({})\naddress: {}\nports: command {}, control {}\ndevice status: {device_status}\npassword: {password}\n",
         text(reply.product_name().as_str()),
         text(reply.device_name().as_str()),
-        address[0],
-        address[1],
-        address[2],
-        address[3],
+        Ipv4Addr::from(reply.address().octets()),
         reply.command_port().number(),
         reply.control_port().number(),
     )
@@ -103,25 +104,66 @@ pub fn state(state: &State) -> String {
     )
 }
 
+fn sheets(count: u32) -> String {
+    if count == 1 {
+        "1 sheet".to_owned()
+    } else {
+        format!("{count} sheets")
+    }
+}
+
 /// Lists the written images and the counts of a finished scan.
 #[must_use]
 pub fn scanned(scanned: &Scanned, written: &[PathBuf]) -> String {
-    let mut files = String::new();
-    for path in written {
-        files.push_str(&path.display().to_string());
-        files.push('\n');
-    }
     format!(
-        "{files}sheets: {}\nkeepalive replies: {}\n",
-        scanned.sheets, scanned.keepalive_replies
+        "{}sheets: {}\nkeepalive replies: {}\n",
+        paths(written),
+        scanned.sheets,
+        scanned.keepalive_replies
     )
+}
+
+/// Lists one path on each line.
+#[must_use]
+pub fn paths(written: &[PathBuf]) -> String {
+    let mut lines = String::new();
+    for path in written {
+        lines.push_str(&path.display().to_string());
+        lines.push('\n');
+    }
+    lines
+}
+
+/// Tells the user where the images of a failed scan stay.
+#[must_use]
+pub fn saved_before_failure(folder: &Path) -> String {
+    format!(
+        "the images above stay in {}; scan the remaining sheets again",
+        folder.display()
+    )
+}
+
+#[must_use]
+pub const fn no_sheet() -> &'static str {
+    "the scanner fed no sheet; check that the stack sits in the top chute"
 }
 
 fn greeting(error: &GreetingError) -> String {
     match error {
-        GreetingError::Frame(frame) => format!("the greeting is malformed ({frame:?})"),
+        GreetingError::Frame(_) => "the greeting is malformed".to_owned(),
         GreetingError::Refused { status } => {
             format!("the scanner refused the connection with status {status}")
+        }
+    }
+}
+
+fn header(error: &ReplyHeaderError) -> String {
+    match error {
+        ReplyHeaderError::Refused { status } => {
+            format!("the scanner refused the command with frame status {status}")
+        }
+        ReplyHeaderError::Frame(_) | ReplyHeaderError::LengthBelowHeader { .. } => {
+            "a reply header is malformed".to_owned()
         }
     }
 }
@@ -130,11 +172,15 @@ fn channel<E: Display>(error: &ChannelError<E>) -> String {
     match error {
         ChannelError::Port(error) => error.to_string(),
         ChannelError::Greeting(error) => greeting(error),
-        ChannelError::Header(header) => format!("a reply header is malformed ({header:?})"),
+        ChannelError::Header(error) => header(error),
         ChannelError::ReplyTooLarge { declared, capacity } => {
             format!("a reply of {declared} bytes exceeds the buffer of {capacity} bytes")
         }
     }
+}
+
+fn command<E: Display>(error: &ChannelError<E>) -> String {
+    format!("the command connection failed: {}", channel(error))
 }
 
 fn refusal(refusal: ReserveRefusal) -> String {
@@ -161,9 +207,11 @@ fn refusal(refusal: ReserveRefusal) -> String {
 
 fn control<E: Display>(error: &ControlError<E>) -> String {
     match error {
-        ControlError::Port(error) => error.to_string(),
-        ControlError::Greeting(error) => greeting(error),
-        ControlError::Frame(frame) => format!("a control reply is malformed ({frame:?})"),
+        ControlError::Port(error) => format!("the control connection failed: {error}"),
+        ControlError::Greeting(error) => {
+            format!("the control connection failed: {}", greeting(error))
+        }
+        ControlError::Frame(_) => "a control reply is malformed".to_owned(),
         ControlError::Reserve(reason) => refusal(*reason),
         ControlError::Release(result) => {
             format!("the scanner refused the release with result {result}")
@@ -171,15 +219,28 @@ fn control<E: Display>(error: &ControlError<E>) -> String {
     }
 }
 
+fn scsi(status: ScsiStatus) -> String {
+    match status {
+        ScsiStatus::Good => "good".to_owned(),
+        ScsiStatus::CheckCondition => "check condition".to_owned(),
+        ScsiStatus::Busy => "busy".to_owned(),
+        ScsiStatus::Unrecognized(code) => format!("status {code}"),
+    }
+}
+
 fn condition(condition: Condition) -> String {
     match condition {
         Condition::EndOfSide => "the scanner ended a side early".to_owned(),
         Condition::PaperJam => {
-            "paper jam; open the scanner, remove the paper, and scan again".to_owned()
+            "paper jam; open the scanner, remove the paper, and scan the remaining sheets again"
+                .to_owned()
         }
-        Condition::CoverOpen => "a scanner cover is open".to_owned(),
-        Condition::NoPaper => "no paper in the top chute".to_owned(),
-        Condition::DoubleFeed => "the scanner fed two sheets at once".to_owned(),
+        Condition::CoverOpen => "a scanner cover is open; close it and scan again".to_owned(),
+        Condition::NoPaper => no_paper(),
+        Condition::DoubleFeed => {
+            "the scanner fed two sheets at once; separate the remaining sheets and scan them again"
+                .to_owned()
+        }
         Condition::NoDataYet => "the scanner had no image data ready".to_owned(),
         Condition::InvalidField => "the scanner refused a field of a command".to_owned(),
         Condition::Unrecognized {
@@ -190,21 +251,26 @@ fn condition(condition: Condition) -> String {
     }
 }
 
+fn no_paper() -> String {
+    "no paper in the top chute; load the stack and scan again".to_owned()
+}
+
 fn job(error: JobError) -> String {
     match error {
-        JobError::NoPaper => "no paper in the top chute".to_owned(),
+        JobError::NoPaper => no_paper(),
         JobError::UnsupportedPaperPath => {
             "paper in the front slot isn't supported yet; load it into the top chute".to_owned()
         }
-        JobError::Refused { status } => {
-            format!("the scanner refused a scan command with status {status}")
-        }
+        JobError::Refused { status } => format!(
+            "the scanner refused a scan command ({})",
+            scsi(ScsiStatus::Unrecognized(status))
+        ),
         JobError::SenseUnavailable => "the scanner reported an error without details".to_owned(),
         JobError::Condition(reported) => condition(reported),
-        JobError::Status(status) => format!("a status reply is malformed ({status:?})"),
-        JobError::Sense(sense) => format!("an error report is malformed ({sense:?})"),
-        JobError::Chunk(chunk) => format!("an image reply is malformed ({chunk:?})"),
-        JobError::PixelSize(size) => format!("a page size reply is malformed ({size:?})"),
+        JobError::Status(_) => "a status reply is malformed".to_owned(),
+        JobError::Sense(_) => "an error report is malformed".to_owned(),
+        JobError::Chunk(_) => "an image reply is malformed".to_owned(),
+        JobError::PixelSize(_) => "a page size reply is malformed".to_owned(),
         JobError::HeightOutOfRange { lines } => {
             format!("a page of {lines} lines exceeds the height that an image can hold")
         }
@@ -222,23 +288,19 @@ fn job(error: JobError) -> String {
 
 fn scan<E: Display, K: Display>(error: &ScanError<E, K>) -> String {
     match error {
-        ScanError::Channel(error) => format!("the command connection failed: {}", channel(error)),
+        ScanError::Channel(error) => command(error),
         ScanError::Sink(error) => format!("an image couldn't be saved: {error}"),
         ScanError::Job(error) => job(*error),
     }
 }
 
-fn status_refused(status: ScsiStatus) -> String {
-    format!("the scanner refused the status request ({status:?})")
-}
-
 fn session<E: Display, K: Display>(error: &SessionError<E, K>) -> String {
     match error {
-        SessionError::Command(error) => {
-            format!("the command connection failed: {}", channel(error))
+        SessionError::Command(error) => command(error),
+        SessionError::StatusRefused(status) => {
+            format!("the scanner refused the status request ({})", scsi(*status))
         }
-        SessionError::StatusRefused(status) => status_refused(*status),
-        SessionError::Status(status) => format!("a status reply is malformed ({status:?})"),
+        SessionError::Status(_) => "a status reply is malformed".to_owned(),
         SessionError::NotRegistered => {
             "the scanner has no registered host; pair it once with ScanSnap Home".to_owned()
         }
@@ -256,10 +318,17 @@ fn session<E: Display, K: Display>(error: &SessionError<E, K>) -> String {
             control(error)
         ),
         SessionError::Release { summary, failure } => format!(
-            "{} sheets were scanned, but {}",
-            summary.sheets,
+            "{} scanned, but {}",
+            sheets(summary.sheets),
             control(failure)
         ),
+    }
+}
+
+const fn connection(connection: Connection) -> &'static str {
+    match connection {
+        Connection::Command => "command",
+        Connection::Control => "control",
     }
 }
 
@@ -267,15 +336,37 @@ fn session<E: Display, K: Display>(error: &SessionError<E, K>) -> String {
 #[must_use]
 pub fn failure<E: Display, K: Display>(failure: &Failure<E, K>) -> String {
     match failure {
-        Failure::Network(error) => format!("the network failed: {error}"),
-        Failure::Search(SearchError::Port(error)) => format!("the discovery port failed: {error}"),
-        Failure::Search(SearchError::NoReply { attempts }) => format!(
-            "no scanner answered {attempts} search probes; give its address with --address, and let vens receive replies through the firewall"
+        Failure::Route { target, error } if target.is_broadcast() => format!(
+            "this host has no route for a broadcast search ({error}); give the scanner's address with --address"
         ),
-        Failure::Command(error) => format!("the command connection failed: {}", channel(error)),
-        Failure::Control(error) => format!("the control connection failed: {}", control(error)),
-        Failure::StatusRefused(status) => status_refused(*status),
-        Failure::Status(status) => format!("a status reply is malformed ({status:?})"),
+        Failure::Route { target, error } => format!("this host has no route to {target}: {error}"),
+        Failure::Discovery(error) => format!("the discovery port failed: {error}"),
+        Failure::NoReply { target, attempts } if target.is_broadcast() => format!(
+            "no scanner answered {attempts} search probes; check that the scanner is on and on this network, give its address with --address, and let vens receive replies through the firewall"
+        ),
+        Failure::NoReply { target, attempts } => format!(
+            "no scanner answered {attempts} search probes at {target}; check that the scanner is on and still has that address"
+        ),
+        Failure::Trigger(error) => format!("the port for button events couldn't open: {error}"),
+        Failure::Clock(error) => {
+            format!("the system clock can't give the reserve time ({error}); set the date and time")
+        }
+        Failure::Connect {
+            connection: kind,
+            error,
+        } => format!(
+            "the {} connection to the scanner failed: {error}",
+            connection(*kind)
+        ),
+        Failure::Keepalive(error) => {
+            format!("the keepalive port couldn't change its mode: {error}")
+        }
+        Failure::Command(error) => command(error),
+        Failure::Control(error) => control(error),
+        Failure::StatusRefused(status) => {
+            format!("the scanner refused the status request ({})", scsi(*status))
+        }
+        Failure::Status(_) => "a status reply is malformed".to_owned(),
         Failure::Session(error) => session(error),
     }
 }

@@ -33,8 +33,23 @@ const REPLY_CAPACITY: usize = 0x0030_0040;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Failure<E, K> {
-    Network(E),
-    Search(SearchError<E>),
+    /// The host has no route toward the search target.
+    Route {
+        target: Ipv4Addr,
+        error: E,
+    },
+    Discovery(E),
+    NoReply {
+        target: Ipv4Addr,
+        attempts: u8,
+    },
+    Trigger(E),
+    Clock(E),
+    Connect {
+        connection: Connection,
+        error: E,
+    },
+    Keepalive(E),
     Command(ChannelError<E>),
     Control(ControlError<E>),
     StatusRefused(ScsiStatus),
@@ -58,6 +73,13 @@ pub struct Scanned {
     pub keepalive_replies: u32,
 }
 
+/// The outcome of a scan and the first failure of its keepalive port, which never stops the job.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ScanRun<E, K> {
+    pub outcome: Result<Scanned, Failure<E, K>>,
+    pub keepalive_failure: Option<E>,
+}
+
 struct Found<D> {
     reply: SearchReply,
     local: Ipv4Address,
@@ -68,15 +90,20 @@ fn find<N: Network, K>(
     network: &mut N,
     target: Ipv4Addr,
 ) -> Result<Found<N::Discovery>, Failure<N::Error, K>> {
-    let local = network.local_address(target).map_err(Failure::Network)?;
-    let mut discovery = network.open_discovery().map_err(Failure::Network)?;
+    let local = network
+        .local_address(target)
+        .map_err(|error| Failure::Route { target, error })?;
+    let mut discovery = network.open_discovery().map_err(Failure::Discovery)?;
     let reply = search(
         &mut discovery,
         Probe::search(local, HOST_MAC),
         SocketAddrV4::new(target, DISCOVERY_PORT),
         SEARCH_ATTEMPTS,
     )
-    .map_err(Failure::Search)?;
+    .map_err(|error| match error {
+        SearchError::Port(error) => Failure::Discovery(error),
+        SearchError::NoReply { attempts } => Failure::NoReply { target, attempts },
+    })?;
     Ok(Found {
         reply,
         local,
@@ -88,15 +115,23 @@ fn scanner(reply: &SearchReply, port: u16) -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::from(reply.address().octets()), port)
 }
 
+fn connect<N: Network, K>(
+    network: &mut N,
+    endpoint: SocketAddrV4,
+    connection: Connection,
+) -> Result<N::Stream, Failure<N::Error, K>> {
+    network
+        .connect(endpoint, connection)
+        .map_err(|error| Failure::Connect { connection, error })
+}
+
 fn open_command<N: Network, K>(
     network: &mut N,
     reply: &SearchReply,
     local: Ipv4Address,
 ) -> Result<CommandChannel<N::Stream>, Failure<N::Error, K>> {
     let endpoint = scanner(reply, reply.command_port().number());
-    let stream = network
-        .connect(endpoint, Connection::Command)
-        .map_err(Failure::Network)?;
+    let stream = connect(network, endpoint, Connection::Command)?;
     CommandChannel::open(stream, HOST_MAC, local).map_err(Failure::Command)
 }
 
@@ -139,29 +174,39 @@ pub fn status<N: Network>(
 
 /// Finds the scanner, scans the stack in its top chute into the sink, and keeps the reserve alive meanwhile.
 ///
-/// # Errors
-///
-/// Fails when the network fails, no scanner answers, a connection fails, or the session fails.
+/// The run carries the outcome and any failure of the keepalive port, which never stops the job.
 pub fn scan<N: Network, K: PageSink>(
     network: &mut N,
     target: Ipv4Addr,
     sink: &mut K,
+) -> ScanRun<N::Error, K::Error> {
+    let mut keepalive_failure = None;
+    let outcome = scan_with(network, target, sink, &mut keepalive_failure);
+    ScanRun {
+        outcome,
+        keepalive_failure,
+    }
+}
+
+fn scan_with<N: Network, K: PageSink>(
+    network: &mut N,
+    target: Ipv4Addr,
+    sink: &mut K,
+    keepalive_failure: &mut Option<N::Error>,
 ) -> Result<Scanned, Failure<N::Error, K::Error>> {
     let found = find(network, target)?;
     let (_trigger, trigger_port) = network
         .open_trigger(found.local)
-        .map_err(Failure::Network)?;
-    let time = network.local_time().map_err(Failure::Network)?;
+        .map_err(Failure::Trigger)?;
+    let time = network.local_time().map_err(Failure::Clock)?;
     let mut command = open_command(network, &found.reply, found.local)?;
     let control_endpoint = scanner(&found.reply, found.reply.control_port().number());
-    let control_stream = network
-        .connect(control_endpoint, Connection::Control)
-        .map_err(Failure::Network)?;
+    let control_stream = connect(network, control_endpoint, Connection::Control)?;
     let mut control = ControlChannel::open(control_stream).map_err(Failure::Control)?;
     let mut clock = network.clock();
     let keepalive_port = network
         .keepalive(found.discovery)
-        .map_err(Failure::Network)?;
+        .map_err(Failure::Keepalive)?;
     let mut keepalive = DatagramKeepalive::new(
         keepalive_port,
         Probe::keepalive(found.local, HOST_MAC),
@@ -185,6 +230,8 @@ pub fn scan<N: Network, K: PageSink>(
         &mut buffer,
     );
     let keepalive_replies = keepalive.replies();
+    let (_, failure) = keepalive.into_parts();
+    *keepalive_failure = failure;
     outcome
         .map(|summary| Scanned {
             sheets: summary.sheets,
