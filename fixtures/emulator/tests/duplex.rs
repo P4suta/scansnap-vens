@@ -10,13 +10,15 @@ use std::{
 use vens_core::{
     Ipv4Address, MacAddress, Port,
     control::LocalTime,
-    discovery::Probe,
+    discovery::{Probe, SearchReply},
     job::{Pause, Summary},
     jpeg::{self, FrameSize, JpegError, frame_size},
     scan::Side,
 };
 use vens_emulator::{
-    redact::{HOST_ADDRESS, SCANNER_ADDRESS, SERIAL, TRIGGER_PORT},
+    redact::{
+        DEVICE_NAME, HOST_ADDRESS, HOST_ID, SCANNER_ADDRESS, SCANNER_MAC, SERIAL, TRIGGER_PORT,
+    },
     replay::{DatagramReplay, Replay, ReplayError},
 };
 use vens_net::{
@@ -26,7 +28,7 @@ use vens_net::{
     scan::{Clock, PageSink},
     search::search,
     session::{Host, SessionError, scan_once},
-    trace::{self, Channel, Event},
+    trace::{self, Channel, Direction, Event},
 };
 
 const FIXTURE: &str = include_str!("../traces/one-duplex-sheet.trace");
@@ -142,6 +144,42 @@ fn the_session_keeps_the_recorded_order_across_both_connections() {
 #[test]
 fn the_fixture_parses() {
     assert_eq!(trace::parse(FIXTURE).map(|events| events.len()), Ok(101));
+}
+
+fn first_with_length(channel: Channel, direction: Direction, length: usize) -> Option<Vec<u8>> {
+    events()
+        .into_iter()
+        .find(|event| {
+            event.channel == channel && event.direction == direction && event.bytes.len() == length
+        })
+        .map(|event| event.bytes)
+}
+
+#[test]
+fn the_fixture_carries_documentation_identifiers_only() {
+    let reply = first_with_length(Channel::Discovery, Direction::Received, 144)
+        .and_then(|bytes| SearchReply::decode(&bytes).ok());
+    let status = first_with_length(Channel::Command, Direction::Received, 0x30);
+    let reserve = first_with_length(Channel::Control, Direction::Sent, 128);
+    assert_eq!(
+        (
+            reply.map(|reply| (
+                reply.mac().octets(),
+                reply.device_name().as_str().map(str::to_owned),
+                reply.last_owner().bytes(),
+            )),
+            status.and_then(|bytes| bytes.get(0x20..0x28).map(<[u8]>::to_vec)),
+            reserve.map(|bytes| (
+                bytes.get(44..48).map(<[u8]>::to_vec),
+                bytes.get(108..116).map(<[u8]>::to_vec),
+            )),
+        ),
+        (
+            Some((SCANNER_MAC, Some(DEVICE_NAME.to_owned()), HOST_ID)),
+            Some(HOST_ID.to_vec()),
+            Some((Some(HOST_ADDRESS.to_vec()), Some(HOST_ID.to_vec()))),
+        )
+    );
 }
 
 #[test]
