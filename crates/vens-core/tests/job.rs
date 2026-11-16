@@ -283,6 +283,36 @@ fn a_busy_scanner_gets_the_same_command_again_after_a_pause() {
     );
 }
 
+fn busy_replies(count: usize) -> Vec<(ScsiStatus, Vec<u8>)> {
+    std::iter::repeat_with(|| (ScsiStatus::Busy, Vec::new()))
+        .take(count)
+        .collect()
+}
+
+#[test]
+fn a_hundred_and_one_busy_replies_in_a_row_exhaust_the_retries() {
+    assert_eq!(
+        drive(&busy_replies(101)).last(),
+        Some(&Seen::Failed(JobError::RetriesExhausted(Pause::Busy)))
+    );
+}
+
+#[test]
+fn the_busy_budget_starts_again_after_each_answered_command() {
+    let replies = [
+        busy_replies(100),
+        [(GOOD, Vec::new())].to_vec(),
+        busy_replies(100),
+        [(GOOD, Vec::new())].to_vec(),
+    ]
+    .concat();
+    let seen = drive(&replies);
+    assert_eq!(
+        seen.iter().rev().take(2).collect::<Vec<_>>(),
+        [&Seen::ScriptEnded, &Seen::Op(0xD4)]
+    );
+}
+
 #[test]
 fn no_paper_on_the_first_read_of_a_sheet_ends_the_job_normally() {
     let replies = with(
