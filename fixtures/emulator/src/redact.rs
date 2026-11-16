@@ -1,6 +1,7 @@
-//! Turns a raw hardware trace into a fixture that keeps every status, sense, and length.
+//! Turns a raw hardware trace into a fixture that keeps every status, sense key, and request length.
 //! Identifier fields receive documentation values, and each side's image becomes a synthetic one with the original frame size.
-//! The field offsets follow sections 2.1, 5.1 to 5.4, 7.1, 7.2, and 8.3 of the ix1300-wifi protocol document.
+//! The read residue after each side then describes the synthetic image, so the fixture doesn't reveal the original image sizes.
+//! The field offsets follow sections 2.1, 5.1 to 5.4, 7.1, 7.2, 8.3, and 8.10 of the ix1300-wifi protocol document.
 
 use std::iter;
 
@@ -8,6 +9,7 @@ use vens_core::jpeg::{FrameSize, frame_size};
 use vens_net::trace::{Channel, Direction, Event};
 
 pub const HOST_ADDRESS: [u8; 4] = [192, 0, 2, 12];
+pub const HOST_MAC: [u8; 6] = [0x02, 0x76, 0x65, 0x6E, 0x73, 0x01];
 pub const OTHER_HOST_ADDRESS: [u8; 4] = [192, 0, 2, 20];
 pub const SCANNER_ADDRESS: [u8; 4] = [192, 0, 2, 7];
 pub const SCANNER_MAC: [u8; 6] = [0x00, 0x00, 0x5E, 0x00, 0x53, 0x07];
@@ -16,11 +18,13 @@ pub const DEVICE_NAME: &str = "iX1300-EXAMPLE001";
 pub const SERIAL: &str = "EXAMPLE001";
 pub const TRIGGER_PORT: u16 = 55265;
 const RESERVE_TIME: [u8; 7] = [0x07, 0xEA, 1, 1, 0, 0, 0];
+const NO_OFFSET: [u8; 4] = [0; 4];
 
 const KEY: [u8; 4] = *b"VENS";
 const KEY_FIELD: usize = 4;
 const PROBE_LENGTH: usize = 32;
 const PROBE_HOST: usize = 8;
+const PROBE_MAC: usize = 12;
 const SEARCH_REPLY_LENGTH: usize = 144;
 const SEARCH_SCANNER_ADDRESS: usize = 16;
 const SEARCH_SCANNER_MAC: usize = 28;
@@ -32,7 +36,9 @@ const SEARCH_SERIAL: usize = 132;
 const SERIAL_LENGTH: usize = 12;
 const GREETING_LENGTH: usize = 16;
 const REQUEST_LENGTH: usize = 64;
+const REQUEST_MAC: usize = 16;
 const REQUEST_HOST: usize = 24;
+const REQUEST_DATA_IN: usize = 36;
 const REQUEST_DATA_OUT: usize = 40;
 const REQUEST_CDB: usize = 48;
 const REPLY_HEADER_LENGTH: usize = 40;
@@ -44,19 +50,25 @@ const RELEASE_REPLY_LENGTH: usize = 16;
 const OPERATION: usize = 8;
 const RESERVE_OPERATION: [u8; 4] = [0, 0, 0, 0x11];
 const RELEASE_OPERATION: [u8; 4] = [0, 0, 0, 0x12];
+const CONTROL_MAC: usize = 16;
 const RESERVE_HOST: usize = 44;
 const RESERVE_TRIGGER: usize = 48;
 const RESERVE_TIME_FIELD: usize = 100;
 const RESERVE_HOST_ID: usize = 108;
+const RESERVE_OFFSET: usize = 116;
 const STATUS_HOST_ID: usize = 0x20;
 const HARDWARE_STATUS: u8 = 0xC2;
+const REQUEST_SENSE: u8 = 0x03;
 const READ: u8 = 0x28;
 const READ_IMAGE: u8 = 0x00;
 const CDB_KIND: usize = 2;
 const CDB_PAGE: usize = 10;
 const GOOD: u32 = 0;
 const CHECK_CONDITION: u32 = 2;
+const BUSY: u32 = 8;
 const IMAGE_PREFIX: usize = 2;
+const BUSY_PAYLOAD: usize = 34;
+const SENSE_INFORMATION: usize = 3;
 const SHORTEST_IDENTIFIER: usize = 4;
 const NO_ADDRESS: [u8; 4] = [0; 4];
 const SYNTHETIC_COMMENT: &[u8] = b"synthetic image";
@@ -69,6 +81,8 @@ pub enum RedactError {
     MissingFrameHeader { index: usize },
     /// An identifier from the raw trace still appears in the event at `index`.
     IdentifierSurvived { index: usize },
+    /// The trace ends inside a command exchange.
+    Incomplete,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +90,7 @@ struct Request {
     opcode: u8,
     kind: u8,
     page: u8,
+    data_in: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +117,9 @@ struct Chunk {
     page: u8,
     header: usize,
     payload: usize,
+    ends_side: bool,
+    data_in: u32,
+    sense: Option<usize>,
 }
 
 struct Redaction {
@@ -109,6 +127,7 @@ struct Redaction {
     identifiers: Vec<Vec<u8>>,
     command: Expect,
     chunks: Vec<Chunk>,
+    awaiting_sense: Option<usize>,
 }
 
 fn field<const N: usize>(frame: &[u8], offset: usize) -> Option<[u8; N]> {
@@ -132,17 +151,24 @@ fn padded<const N: usize>(text: &str) -> [u8; N] {
     field
 }
 
+/// Returns a text field without its zero terminator and without trailing space padding.
 fn text(field: &[u8]) -> Vec<u8> {
-    field
+    let used: Vec<u8> = field
         .iter()
         .copied()
         .take_while(|byte| *byte != 0)
-        .collect()
+        .collect();
+    let length = used
+        .iter()
+        .rposition(|byte| *byte != b' ')
+        .map_or(0, |last| last.saturating_add(1));
+    used.into_iter().take(length).collect()
 }
 
 fn identifying(bytes: &[u8]) -> bool {
-    let documentation: [&[u8]; 7] = [
+    let documentation: [&[u8]; 8] = [
         &HOST_ADDRESS,
+        &HOST_MAC,
         &OTHER_HOST_ADDRESS,
         &SCANNER_ADDRESS,
         &SCANNER_MAC,
@@ -206,6 +232,7 @@ impl Redaction {
             (Direction::Sent, PROBE_LENGTH) => {
                 self.identifiers
                     .push(swap(frame, PROBE_HOST, &HOST_ADDRESS)?);
+                self.identifiers.push(swap(frame, PROBE_MAC, &HOST_MAC)?);
             }
             (Direction::Received, SEARCH_REPLY_LENGTH) => {
                 self.identifiers
@@ -248,6 +275,7 @@ impl Redaction {
         match (direction, frame.len()) {
             (Direction::Received, length) if replies.contains(&length) => {}
             (Direction::Sent, RESERVE_LENGTH) if operation == Some(RESERVE_OPERATION) => {
+                self.identifiers.push(swap(frame, CONTROL_MAC, &HOST_MAC)?);
                 self.identifiers
                     .push(swap(frame, RESERVE_HOST, &HOST_ADDRESS)?);
                 swap(
@@ -256,44 +284,32 @@ impl Redaction {
                     &u32::from(TRIGGER_PORT).to_be_bytes(),
                 )?;
                 swap(frame, RESERVE_TIME_FIELD, &RESERVE_TIME)?;
-                self.identifiers
-                    .push(swap(frame, RESERVE_HOST_ID, &HOST_ID)?);
+                swap(frame, RESERVE_OFFSET, &NO_OFFSET)?;
+                let reserved: [u8; 8] = field(frame, RESERVE_HOST_ID)?;
+                if identifying(&reserved) {
+                    self.identifiers
+                        .push(swap(frame, RESERVE_HOST_ID, &HOST_ID)?);
+                }
             }
-            (Direction::Sent, RELEASE_LENGTH) if operation == Some(RELEASE_OPERATION) => {}
+            (Direction::Sent, RELEASE_LENGTH) if operation == Some(RELEASE_OPERATION) => {
+                self.identifiers.push(swap(frame, CONTROL_MAC, &HOST_MAC)?);
+            }
             _ => return None,
         }
         Some(())
     }
 
     fn command(&mut self, index: usize) -> Option<()> {
-        let event = self.events.get_mut(index)?;
+        let event = self.events.get(index)?;
         let direction = event.direction;
-        let frame = event.bytes.as_mut_slice();
-        let length = frame.len();
-        let keyed = field(frame, KEY_FIELD) == Some(KEY);
+        let length = event.bytes.len();
+        let keyed = field(&event.bytes, KEY_FIELD) == Some(KEY);
         self.command = match (self.command, direction) {
             (Expect::Greeting, Direction::Received) if keyed && length == GREETING_LENGTH => {
                 Expect::Request
             }
             (Expect::Request, Direction::Sent) if keyed && length == REQUEST_LENGTH => {
-                self.identifiers
-                    .push(swap(frame, REQUEST_HOST, &HOST_ADDRESS)?);
-                let cdb: [u8; 16] = field(frame, REQUEST_CDB)?;
-                let request = Request {
-                    opcode: *cdb.first()?,
-                    kind: *cdb.get(CDB_KIND)?,
-                    page: *cdb.get(CDB_PAGE)?,
-                };
-                let data_out =
-                    usize::try_from(u32::from_be_bytes(field(frame, REQUEST_DATA_OUT)?)).ok()?;
-                if data_out == 0 {
-                    Expect::ReplyHeader { request }
-                } else {
-                    Expect::DataOut {
-                        length: data_out,
-                        request,
-                    }
-                }
+                self.request(index)?
             }
             (
                 Expect::DataOut {
@@ -305,19 +321,7 @@ impl Redaction {
             (Expect::ReplyHeader { request }, Direction::Received)
                 if keyed && length == REPLY_HEADER_LENGTH =>
             {
-                let total = usize::try_from(u32::from_be_bytes(field(frame, 0)?)).ok()?;
-                let payload = total.checked_sub(REPLY_HEADER_LENGTH)?;
-                let status = u32::from_be_bytes(field(frame, REPLY_STATUS)?);
-                if payload == 0 {
-                    Expect::Request
-                } else {
-                    Expect::ReplyPayload {
-                        length: payload,
-                        status,
-                        header: index,
-                        request,
-                    }
-                }
+                self.reply_header(index, request)?
             }
             (
                 Expect::ReplyPayload {
@@ -328,24 +332,7 @@ impl Redaction {
                 },
                 Direction::Received,
             ) if length == expected => {
-                if request.opcode == HARDWARE_STATUS {
-                    let registered: Option<[u8; 8]> = field(frame, STATUS_HOST_ID);
-                    if registered.is_some_and(|identifier| identifying(&identifier)) {
-                        self.identifiers
-                            .push(swap(frame, STATUS_HOST_ID, &HOST_ID)?);
-                    }
-                }
-                let carries_image = request.opcode == READ
-                    && request.kind == READ_IMAGE
-                    && (status == GOOD || status == CHECK_CONDITION)
-                    && length > IMAGE_PREFIX;
-                if carries_image {
-                    self.chunks.push(Chunk {
-                        page: request.page,
-                        header,
-                        payload: index,
-                    });
-                }
+                self.reply_payload(index, status, header, request)?;
                 Expect::Request
             }
             _ => return None,
@@ -353,20 +340,110 @@ impl Redaction {
         Some(())
     }
 
-    fn replace_images(&mut self) -> Result<(), RedactError> {
-        let mut pages: Vec<u8> = Vec::new();
-        for chunk in &self.chunks {
-            if !pages.contains(&chunk.page) {
-                pages.push(chunk.page);
+    fn request(&mut self, index: usize) -> Option<Expect> {
+        let frame = self.events.get_mut(index)?.bytes.as_mut_slice();
+        self.identifiers.push(swap(frame, REQUEST_MAC, &HOST_MAC)?);
+        self.identifiers
+            .push(swap(frame, REQUEST_HOST, &HOST_ADDRESS)?);
+        let cdb: [u8; 16] = field(frame, REQUEST_CDB)?;
+        let request = Request {
+            opcode: *cdb.first()?,
+            kind: *cdb.get(CDB_KIND)?,
+            page: *cdb.get(CDB_PAGE)?,
+            data_in: u32::from_be_bytes(field(frame, REQUEST_DATA_IN)?),
+        };
+        let data_out = usize::try_from(u32::from_be_bytes(field(frame, REQUEST_DATA_OUT)?)).ok()?;
+        Some(if data_out == 0 {
+            Expect::ReplyHeader { request }
+        } else {
+            Expect::DataOut {
+                length: data_out,
+                request,
+            }
+        })
+    }
+
+    fn reply_header(&self, index: usize, request: Request) -> Option<Expect> {
+        let frame = self.events.get(index)?.bytes.as_slice();
+        let total = usize::try_from(u32::from_be_bytes(field(frame, 0)?)).ok()?;
+        let payload = total.checked_sub(REPLY_HEADER_LENGTH)?;
+        let status = u32::from_be_bytes(field(frame, REPLY_STATUS)?);
+        Some(if payload == 0 {
+            Expect::Request
+        } else {
+            Expect::ReplyPayload {
+                length: payload,
+                status,
+                header: index,
+                request,
+            }
+        })
+    }
+
+    fn reply_payload(
+        &mut self,
+        index: usize,
+        status: u32,
+        header: usize,
+        request: Request,
+    ) -> Option<()> {
+        let awaiting = self.awaiting_sense.take();
+        let frame = self.events.get_mut(index)?.bytes.as_mut_slice();
+        let length = frame.len();
+        if request.opcode == HARDWARE_STATUS {
+            let registered: Option<[u8; 8]> = field(frame, STATUS_HOST_ID);
+            if registered.is_some_and(|identifier| identifying(&identifier)) {
+                self.identifiers
+                    .push(swap(frame, STATUS_HOST_ID, &HOST_ID)?);
             }
         }
-        for page in pages {
-            let side: Vec<Chunk> = self
-                .chunks
-                .iter()
-                .filter(|chunk| chunk.page == page)
-                .copied()
-                .collect();
+        if request.opcode == REQUEST_SENSE
+            && let Some(chunk) = awaiting.and_then(|chunk| self.chunks.get_mut(chunk))
+        {
+            chunk.sense = Some(index);
+        }
+        if request.opcode == READ && request.kind == READ_IMAGE {
+            match status {
+                GOOD | CHECK_CONDITION if length > IMAGE_PREFIX => {
+                    let ends_side = status == CHECK_CONDITION;
+                    if ends_side {
+                        self.awaiting_sense = Some(self.chunks.len());
+                    }
+                    self.chunks.push(Chunk {
+                        page: request.page,
+                        header,
+                        payload: index,
+                        ends_side,
+                        data_in: request.data_in,
+                        sense: None,
+                    });
+                }
+                GOOD | CHECK_CONDITION => {}
+                BUSY if length <= BUSY_PAYLOAD => {}
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    /// Groups consecutive chunks into sides: a side ends at a chunk with a check condition or at a change of page.
+    fn sides(&self) -> Vec<Vec<Chunk>> {
+        let mut sides: Vec<Vec<Chunk>> = Vec::new();
+        let mut open = false;
+        for chunk in &self.chunks {
+            match sides.last_mut() {
+                Some(side) if open && side.last().is_some_and(|last| last.page == chunk.page) => {
+                    side.push(*chunk);
+                }
+                Some(_) | None => sides.push(Vec::from([*chunk])),
+            }
+            open = !chunk.ends_side;
+        }
+        sides
+    }
+
+    fn replace_images(&mut self) -> Result<(), RedactError> {
+        for side in self.sides() {
             self.replace_side(&side)?;
         }
         Ok(())
@@ -396,14 +473,18 @@ impl Redaction {
             let payload = self.events.get_mut(chunk.payload).ok_or(unexpected)?;
             let prefix: Vec<u8> = payload.bytes.iter().copied().take(IMAGE_PREFIX).collect();
             payload.bytes = [prefix.as_slice(), part].concat();
-            let total = payload
-                .bytes
-                .len()
-                .checked_add(REPLY_HEADER_LENGTH)
-                .and_then(|total| u32::try_from(total).ok())
+            let length = u32::try_from(payload.bytes.len()).map_err(|_| unexpected)?;
+            let total = length
+                .checked_add(u32::try_from(REPLY_HEADER_LENGTH).map_err(|_| unexpected)?)
                 .ok_or(unexpected)?;
             let header = self.events.get_mut(chunk.header).ok_or(unexpected)?;
             swap(&mut header.bytes, 0, &total.to_be_bytes()).ok_or(unexpected)?;
+            if let Some(sense) = chunk.sense {
+                let residue = chunk.data_in.checked_sub(length).ok_or(unexpected)?;
+                let sense = self.events.get_mut(sense).ok_or(unexpected)?;
+                swap(&mut sense.bytes, SENSE_INFORMATION, &residue.to_be_bytes())
+                    .ok_or(unexpected)?;
+            }
         }
         Ok(())
     }
@@ -434,18 +515,25 @@ impl Redaction {
 ///
 /// # Errors
 ///
-/// Refuses an event whose shape the protocol doesn't put at its place, an image without a frame header, and any raw identifier that survives the replacement.
+/// Refuses an event whose shape the protocol doesn't put at its place, a trace that ends inside a command exchange, an image without a frame header, and any raw identifier that survives the replacement.
 pub fn redact(raw: &[Event]) -> Result<Vec<Event>, RedactError> {
     let mut redaction = Redaction {
         events: raw.to_vec(),
         identifiers: Vec::new(),
         command: Expect::Greeting,
         chunks: Vec::new(),
+        awaiting_sense: None,
     };
     for index in 0..raw.len() {
         redaction
             .visit(index)
             .ok_or(RedactError::UnexpectedEvent { index })?;
+    }
+    match redaction.command {
+        Expect::Greeting | Expect::Request => {}
+        Expect::DataOut { .. } | Expect::ReplyHeader { .. } | Expect::ReplyPayload { .. } => {
+            return Err(RedactError::Incomplete);
+        }
     }
     redaction.replace_images()?;
     redaction.verify()?;
