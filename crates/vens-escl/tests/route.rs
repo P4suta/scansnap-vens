@@ -1,7 +1,7 @@
 //! The bridge serves the five eSCL requests under the `/eSCL` base path that the advertisement names.
 
 use vens_escl::{
-    route::{Route, Unrouted, route},
+    route::{JobPath, Route, Unrouted, route},
     uuid::Uuid,
 };
 
@@ -30,6 +30,29 @@ fn each_request_maps_to_its_route() {
             job().map(Route::NextDocument).ok_or(Unrouted::NotFound),
             job().map(Route::DeleteJob).ok_or(Unrouted::NotFound),
         ]
+    );
+}
+
+#[test]
+fn a_job_path_names_the_job_under_the_jobs_collection() {
+    assert_eq!(
+        job().map(|id| JobPath::new(id).to_string()),
+        Some(format!("/eSCL/ScanJobs/{JOB}"))
+    );
+}
+
+#[test]
+fn a_job_path_routes_back_to_its_job() {
+    let routed = job().map(|id| {
+        let path = JobPath::new(id).to_string();
+        (
+            route("DELETE", &path),
+            route("GET", &format!("{path}/NextDocument")),
+        )
+    });
+    assert_eq!(
+        routed,
+        job().map(|id| (Ok(Route::DeleteJob(id)), Ok(Route::NextDocument(id))))
     );
 }
 

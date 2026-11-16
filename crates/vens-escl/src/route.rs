@@ -1,8 +1,27 @@
+use core::fmt;
+
 use crate::uuid::Uuid;
 
 const BASE: &str = "/eSCL/";
 const JOBS: &str = "ScanJobs";
 const NEXT_DOCUMENT: &str = "NextDocument";
+
+/// The path of a job, which a `Location` header and a job's status carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobPath(Uuid);
+
+impl JobPath {
+    #[must_use]
+    pub const fn new(job: Uuid) -> Self {
+        Self(job)
+    }
+}
+
+impl fmt::Display for JobPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{BASE}{JOBS}/{}", self.0)
+    }
+}
 
 /// The eSCL request that a method and a request target name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
