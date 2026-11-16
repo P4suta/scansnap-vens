@@ -20,6 +20,8 @@ pub enum ReplayError {
     },
     /// The host went on after the recording ended.
     Exhausted,
+    /// The host connected to an endpoint that the recording doesn't have for that connection.
+    UnknownEndpoint,
     DatagramLength {
         expected: usize,
         actual: usize,
