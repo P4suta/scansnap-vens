@@ -16,7 +16,7 @@ use vens_net::{
     channel::ChannelError,
     control::ControlError,
     network::Connection,
-    operation::{Failure, Scanned, State},
+    operation::{Failure, OpenFailure, Scanned, State},
     scan::ScanError,
     session::{JobFailure, PrepareError, SessionError},
 };
@@ -339,37 +339,47 @@ const fn connection(connection: Connection) -> &'static str {
     }
 }
 
-/// Explains a failure in the words that the user acts on.
-#[must_use]
-pub fn failure<E: Display, K: Display>(failure: &Failure<E, K>) -> String {
+fn open<E: Display>(failure: &OpenFailure<E>) -> String {
     match failure {
-        Failure::Route { target, error } if target.is_broadcast() => format!(
+        OpenFailure::Route { target, error } if target.is_broadcast() => format!(
             "this host has no route for a broadcast search ({error}); give the scanner's address with --address"
         ),
-        Failure::Route { target, error } => format!("this host has no route to {target}: {error}"),
-        Failure::Discovery(error) => format!("the discovery port failed: {error}"),
-        Failure::NoReply { target, attempts } if target.is_broadcast() => format!(
+        OpenFailure::Route { target, error } => {
+            format!("this host has no route to {target}: {error}")
+        }
+        OpenFailure::Discovery(error) => format!("the discovery port failed: {error}"),
+        OpenFailure::NoReply { target, attempts } if target.is_broadcast() => format!(
             "no scanner answered {attempts} search probes; check that the scanner is on and on this network, give its address with --address, and let vens receive replies through the firewall"
         ),
-        Failure::NoReply { target, attempts } => format!(
+        OpenFailure::NoReply { target, attempts } => format!(
             "no scanner answered {attempts} search probes at {target}; check that the scanner is on and still has that address"
         ),
-        Failure::Trigger(error) => format!("the port for button events couldn't open: {error}"),
-        Failure::Clock(error) => {
+        OpenFailure::Trigger(error) => {
+            format!("the port for button events couldn't open: {error}")
+        }
+        OpenFailure::Clock(error) => {
             format!("the system clock can't give the reserve time ({error}); set the date and time")
         }
-        Failure::Connect {
+        OpenFailure::Connect {
             connection: kind,
             error,
         } => format!(
             "the {} connection to the scanner failed: {error}",
             connection(*kind)
         ),
-        Failure::Keepalive(error) => {
+        OpenFailure::Keepalive(error) => {
             format!("the keepalive port couldn't change its mode: {error}")
         }
-        Failure::Command(error) => command(error),
-        Failure::Control(error) => control(error),
+        OpenFailure::Command(error) => command(error),
+        OpenFailure::Control(error) => control(error),
+    }
+}
+
+/// Explains a failure in the words that the user acts on.
+#[must_use]
+pub fn failure<E: Display, K: Display>(failure: &Failure<E, K>) -> String {
+    match failure {
+        Failure::Open(failure) => open(failure),
         Failure::StatusRefused(status) => {
             format!("the scanner refused the status request ({})", scsi(*status))
         }
