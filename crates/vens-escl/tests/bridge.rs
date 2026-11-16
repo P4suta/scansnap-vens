@@ -9,7 +9,7 @@ use vens_escl::{
         Refusal, Request, Response, Side, Unavailable,
     },
     document::{AdfState, Capabilities, JobInfo, JobState, ScannerState, ScannerStatus},
-    route::Unrouted,
+    route::{Method, Unrouted},
     settings::{JobSettings, Requested, Unsupported, accept},
     uuid::Uuid,
 };
@@ -159,7 +159,10 @@ fn unrouted_and_malformed_requests_get_their_refusals() {
             (0, request(Request::Unrouted(Unrouted::NotFound), "a")),
             (
                 0,
-                request(Request::Unrouted(Unrouted::MethodNotAllowed), "b"),
+                request(
+                    Request::Unrouted(Unrouted::MethodNotAllowed(Method::Post)),
+                    "b",
+                ),
             ),
             (0, request(Request::Malformed, "c")),
         ],
@@ -168,7 +171,7 @@ fn unrouted_and_malformed_requests_get_their_refusals() {
         log,
         [
             reply("a", Response::NotFound),
-            reply("b", Response::MethodNotAllowed),
+            reply("b", Response::MethodNotAllowed(Method::Post)),
             reply("c", Response::BadRequest),
         ]
     );

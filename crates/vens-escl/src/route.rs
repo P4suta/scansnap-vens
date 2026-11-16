@@ -38,11 +38,31 @@ pub enum Route {
     DeleteJob(Uuid),
 }
 
+/// The one method that a resource of the bridge allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+    Delete,
+}
+
+impl Method {
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
 /// Why a request names no route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unrouted {
     NotFound,
-    MethodNotAllowed,
+    /// The path names a resource that allows another method.
+    MethodNotAllowed(Method),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +72,26 @@ enum Resource {
     Jobs,
     Job(Uuid),
     NextDocument(Uuid),
+}
+
+impl Resource {
+    const fn allows(self) -> Method {
+        match self {
+            Self::Capabilities | Self::Status | Self::NextDocument(_) => Method::Get,
+            Self::Jobs => Method::Post,
+            Self::Job(_) => Method::Delete,
+        }
+    }
+
+    const fn route(self) -> Route {
+        match self {
+            Self::Capabilities => Route::Capabilities,
+            Self::Status => Route::Status,
+            Self::Jobs => Route::CreateJob,
+            Self::Job(id) => Route::DeleteJob(id),
+            Self::NextDocument(id) => Route::NextDocument(id),
+        }
+    }
 }
 
 fn resource(path: &str) -> Option<Resource> {
@@ -74,23 +114,14 @@ fn resource(path: &str) -> Option<Resource> {
 ///
 /// # Errors
 ///
-/// Refuses a path outside the five requests, and a known path with another method.
+/// Refuses a path outside the five requests, and names the allowed method for a known path with another method.
 pub fn route(method: &str, target: &str) -> Result<Route, Unrouted> {
     let path = target.split_once('?').map_or(target, |(path, _)| path);
     let resource = resource(path).ok_or(Unrouted::NotFound)?;
-    match (method, resource) {
-        ("GET", Resource::Capabilities) => Ok(Route::Capabilities),
-        ("GET", Resource::Status) => Ok(Route::Status),
-        ("POST", Resource::Jobs) => Ok(Route::CreateJob),
-        ("GET", Resource::NextDocument(id)) => Ok(Route::NextDocument(id)),
-        ("DELETE", Resource::Job(id)) => Ok(Route::DeleteJob(id)),
-        (
-            _,
-            Resource::Capabilities
-            | Resource::Status
-            | Resource::Jobs
-            | Resource::Job(_)
-            | Resource::NextDocument(_),
-        ) => Err(Unrouted::MethodNotAllowed),
+    let allowed = resource.allows();
+    if method == allowed.token() {
+        Ok(resource.route())
+    } else {
+        Err(Unrouted::MethodNotAllowed(allowed))
     }
 }

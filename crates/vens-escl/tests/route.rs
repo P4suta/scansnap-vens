@@ -1,7 +1,7 @@
 //! The bridge serves the five eSCL requests under the `/eSCL` base path that the advertisement names.
 
 use vens_escl::{
-    route::{JobPath, Route, Unrouted, route},
+    route::{JobPath, Method, Route, Unrouted, route},
     uuid::Uuid,
 };
 
@@ -65,17 +65,34 @@ fn a_query_string_does_not_change_the_route() {
 }
 
 #[test]
-fn a_known_path_with_another_method_is_not_allowed() {
+fn a_known_path_with_another_method_names_the_method_it_allows() {
     let job_path = format!("/eSCL/ScanJobs/{JOB}");
+    let next = format!("{job_path}/NextDocument");
     assert_eq!(
         [
             route("POST", "/eSCL/ScannerCapabilities"),
             route("DELETE", "/eSCL/ScannerStatus"),
             route("GET", "/eSCL/ScanJobs"),
             route("GET", &job_path),
+            route("POST", &next),
             route("get", "/eSCL/ScannerStatus"),
         ],
-        [Err(Unrouted::MethodNotAllowed); 5]
+        [
+            Err(Unrouted::MethodNotAllowed(Method::Get)),
+            Err(Unrouted::MethodNotAllowed(Method::Get)),
+            Err(Unrouted::MethodNotAllowed(Method::Post)),
+            Err(Unrouted::MethodNotAllowed(Method::Delete)),
+            Err(Unrouted::MethodNotAllowed(Method::Get)),
+            Err(Unrouted::MethodNotAllowed(Method::Get)),
+        ]
+    );
+}
+
+#[test]
+fn each_method_has_its_token() {
+    assert_eq!(
+        [Method::Get, Method::Post, Method::Delete].map(Method::token),
+        ["GET", "POST", "DELETE"]
     );
 }
 

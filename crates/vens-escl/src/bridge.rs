@@ -1,6 +1,6 @@
 use crate::{
     document::{AdfState, Capabilities, JobInfo, JobState, ScannerState, ScannerStatus},
-    route::{JobPath, Unrouted},
+    route::{JobPath, Method, Unrouted},
     settings::{JobSettings, Sides, Unsupported},
     uuid::Uuid,
 };
@@ -98,7 +98,8 @@ pub enum Response<P> {
     Page(P),
     Deleted,
     NotFound,
-    MethodNotAllowed,
+    /// The answer to another method names the method that the resource allows.
+    MethodNotAllowed(Method),
     BadRequest,
     Conflict(Conflict),
     Unavailable(Unavailable),
@@ -314,7 +315,9 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Request::NextDocument(id) => return self.next_document(id, responder, now),
             Request::DeleteJob(id) => return self.delete(id, responder),
             Request::Unrouted(Unrouted::NotFound) => Response::NotFound,
-            Request::Unrouted(Unrouted::MethodNotAllowed) => Response::MethodNotAllowed,
+            Request::Unrouted(Unrouted::MethodNotAllowed(allowed)) => {
+                Response::MethodNotAllowed(allowed)
+            }
             Request::Malformed => Response::BadRequest,
         };
         (self, Effects::reply(responder, response))
