@@ -149,6 +149,32 @@ fn discover_reports_the_recorded_scanner() {
 }
 
 #[test]
+fn discover_marks_a_busy_scanner_and_a_password() {
+    const SEARCH_REPLY: usize = 1;
+    let busy = changed(THREE_SHEETS, SEARCH_REPLY, 38, &[0x00, 0x02]);
+    let protected = changed(THREE_SHEETS, SEARCH_REPLY, 12, &[0x00, 0x00, 0x00, 0x01]);
+    let discover = |events| {
+        invoke(
+            events,
+            Invocation::Discover {
+                target: Ipv4Addr::BROADCAST,
+            },
+        )
+        .map(|output| output.stdout)
+    };
+    assert_eq!(
+        (discover(busy), discover(protected)),
+        (
+            Some(SCANNER.replace("device status: 1", "device status: 2 (busy)")),
+            Some(SCANNER.replace(
+                "password: not set",
+                "password: required, which vens doesn't support yet"
+            )),
+        )
+    );
+}
+
+#[test]
 fn discover_probes_the_target_that_it_is_given() {
     let broadcast = contacts(
         events(THREE_SHEETS),
