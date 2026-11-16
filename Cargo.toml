@@ -17,6 +17,7 @@ rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+roxmltree = "0.21.2"
 vens-core = { path = "crates/vens-core", version = "0.0.0" }
 vens-emulator = { path = "fixtures/emulator", version = "0.0.0" }
 vens-net = { path = "crates/vens-net", version = "0.0.0" }
