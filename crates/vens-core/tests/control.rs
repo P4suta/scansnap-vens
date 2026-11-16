@@ -80,6 +80,21 @@ fn a_registration_reserve_differs_only_in_its_mode() {
 }
 
 #[test]
+fn a_time_gives_back_each_of_its_fields() {
+    assert_eq!(
+        LocalTime::new(2026, 11, 16, 3, 4, 5).map(|time| (
+            time.year(),
+            time.month(),
+            time.day(),
+            time.hour(),
+            time.minute(),
+            time.second()
+        )),
+        Some((2026, 11, 16, 3, 4, 5))
+    );
+}
+
+#[test]
 fn seconds_since_the_unix_epoch_convert_to_the_civil_date_and_time() {
     let known = [
         (0, LocalTime::new(1970, 1, 1, 0, 0, 0)),

@@ -145,6 +145,36 @@ impl LocalTime {
         )
     }
 
+    #[must_use]
+    pub const fn year(self) -> u16 {
+        self.year
+    }
+
+    #[must_use]
+    pub const fn month(self) -> u8 {
+        self.month
+    }
+
+    #[must_use]
+    pub const fn day(self) -> u8 {
+        self.day
+    }
+
+    #[must_use]
+    pub const fn hour(self) -> u8 {
+        self.hour
+    }
+
+    #[must_use]
+    pub const fn minute(self) -> u8 {
+        self.minute
+    }
+
+    #[must_use]
+    pub const fn second(self) -> u8 {
+        self.second
+    }
+
     const fn encode(self) -> [u8; 7] {
         let [high, low] = self.year.to_be_bytes();
         [
