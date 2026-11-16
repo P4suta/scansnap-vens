@@ -47,6 +47,9 @@ pub fn usage_error(error: &UsageError) -> String {
         UsageError::MissingValue(option) => format!("{option} needs a value"),
         UsageError::InvalidAddress(text) => format!("`{text}` is not an IPv4 address"),
         UsageError::UnknownOption(option) => format!("unknown option `{option}`"),
+        UsageError::ForeignOption { option, subcommand } => {
+            format!("{subcommand} doesn't take `{option}`")
+        }
         UsageError::Unexpected(argument) => format!("unexpected argument `{argument}`"),
     }
 }

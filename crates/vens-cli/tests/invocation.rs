@@ -1,11 +1,11 @@
 //! The parser turns the arguments into one typed invocation or a usage error that names the problem.
 
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::{ffi::OsString, net::Ipv4Addr, path::PathBuf};
 
 use vens_cli::invocation::{Invocation, UsageError, parse};
 
-fn arguments(values: &[&str]) -> impl Iterator<Item = String> {
-    values.iter().map(|value| (*value).to_owned())
+fn arguments(values: &[&str]) -> impl Iterator<Item = OsString> {
+    values.iter().map(OsString::from)
 }
 
 #[test]
@@ -116,7 +116,70 @@ fn an_unknown_option_or_an_extra_argument_is_refused() {
             Err(UsageError::UnknownOption("--verbose".to_owned())),
             Err(UsageError::Unexpected("extra".to_owned())),
             Err(UsageError::Unexpected("more".to_owned())),
-            Err(UsageError::UnknownOption("--trace".to_owned())),
+            Err(UsageError::ForeignOption {
+                option: "--trace",
+                subcommand: "status"
+            }),
+        )
+    );
+}
+
+#[test]
+fn help_after_a_subcommand_shows_the_usage() {
+    assert_eq!(
+        (
+            parse(arguments(&["scan", "--help"])),
+            parse(arguments(&["status", "-h"])),
+        ),
+        (Ok(Invocation::Help), Ok(Invocation::Help))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_folder_or_trace_name_that_is_not_text_is_kept_as_it_is() {
+    use std::os::unix::ffi::OsStringExt;
+    let folder = OsString::from_vec(b"scans-\xFF".to_vec());
+    let trace = OsString::from_vec(b"raw-\xFE.trace".to_vec());
+    let invocation = parse(
+        [
+            OsString::from("scan"),
+            folder.clone(),
+            OsString::from("--trace"),
+            trace.clone(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(
+        invocation,
+        Ok(Invocation::Scan {
+            directory: PathBuf::from(folder),
+            target: Ipv4Addr::BROADCAST,
+            trace: Some(PathBuf::from(trace)),
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_subcommand_or_address_that_is_not_text_is_refused() {
+    use std::os::unix::ffi::OsStringExt;
+    let garbled = || OsString::from_vec(b"\xFF".to_vec());
+    assert_eq!(
+        (
+            parse([garbled()].into_iter()),
+            parse(
+                [
+                    OsString::from("discover"),
+                    OsString::from("--address"),
+                    garbled()
+                ]
+                .into_iter()
+            ),
+        ),
+        (
+            Err(UsageError::UnknownSubcommand("\u{FFFD}".to_owned())),
+            Err(UsageError::InvalidAddress("\u{FFFD}".to_owned())),
         )
     );
 }

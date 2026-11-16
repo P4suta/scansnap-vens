@@ -72,7 +72,7 @@ fn run(invocation: Invocation) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
-    let invocation = match invocation::parse(env::args().skip(1)) {
+    let invocation = match invocation::parse(env::args_os().skip(1)) {
         Ok(invocation) => invocation,
         Err(error) => {
             let _ = write!(
