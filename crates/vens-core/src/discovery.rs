@@ -25,6 +25,9 @@ const REPLY_PRODUCT_NAME: usize = 104;
 const REPLY_LAST_OWNER: usize = 124;
 const REPLY_SERIAL: usize = 132;
 const INVALID_REPLY: [u8; 2] = [0xFF, 0xFF];
+const KEEPALIVE_REPLY_LENGTH: usize = 12;
+const KEEPALIVE_REPLY_MARKER_FIELD: usize = 4;
+const KEEPALIVE_REPLY_MARKER: [u8; 2] = [0x80, 0x01];
 const NO_PASSWORD: u32 = 0;
 const DEVICE_READY: u16 = 0;
 const DEVICE_BUSY: u16 = 2;
@@ -75,6 +78,36 @@ impl Probe {
         put(&mut frame, PROBE_HOST_MAC, &self.mac.octets());
         put(&mut frame, PROBE_VERSION, &INTERFACE_VERSION);
         frame
+    }
+}
+
+/// The scanner's answer to a keepalive, which it sends only to the host that holds the reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepaliveReply;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveReplyError {
+    Frame(FrameError),
+    NotAKeepaliveReply,
+}
+
+impl KeepaliveReply {
+    /// # Errors
+    ///
+    /// Refuses a frame that is shorter than a keepalive reply, carries another key, or lacks the keepalive marker.
+    pub fn decode(frame: &[u8]) -> Result<Self, KeepaliveReplyError> {
+        let marker: [u8; 2] = keyed_field(
+            frame,
+            KEEPALIVE_REPLY_LENGTH,
+            REPLY_KEY,
+            KEEPALIVE_REPLY_MARKER_FIELD,
+        )
+        .map_err(KeepaliveReplyError::Frame)?;
+        if marker == KEEPALIVE_REPLY_MARKER {
+            Ok(Self)
+        } else {
+            Err(KeepaliveReplyError::NotAKeepaliveReply)
+        }
     }
 }
 

@@ -2,7 +2,10 @@
 
 use vens_core::{
     FrameError, HostId, Ipv4Address, MacAddress, Port,
-    discovery::{Availability, Password, Probe, SearchReply, SearchReplyError},
+    discovery::{
+        Availability, KeepaliveReply, KeepaliveReplyError, Password, Probe, SearchReply,
+        SearchReplyError,
+    },
 };
 
 const HOST: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
@@ -34,6 +37,46 @@ fn reply() -> [u8; REPLY_LENGTH] {
     );
     put(&mut frame, 132, b"EXAMPLE00001");
     frame
+}
+
+fn keepalive_reply() -> [u8; 12] {
+    let mut frame = [0_u8; 12];
+    put(&mut frame, 0, b"VENS");
+    put(&mut frame, 4, &[0x80, 0x01]);
+    frame
+}
+
+#[test]
+fn a_keepalive_reply_is_recognized_by_its_marker() {
+    assert_eq!(
+        KeepaliveReply::decode(&keepalive_reply()),
+        Ok(KeepaliveReply)
+    );
+}
+
+#[test]
+fn a_search_reply_is_not_a_keepalive_reply() {
+    assert_eq!(
+        KeepaliveReply::decode(&reply()),
+        Err(KeepaliveReplyError::NotAKeepaliveReply)
+    );
+}
+
+#[test]
+fn a_short_or_foreign_keepalive_reply_is_refused() {
+    let mut foreign = keepalive_reply();
+    put(&mut foreign, 0, b"SNEV");
+    assert_eq!(
+        KeepaliveReply::decode(keepalive_reply().get(..11).unwrap_or_default()),
+        Err(KeepaliveReplyError::Frame(FrameError::Truncated {
+            expected: 12,
+            actual: 11
+        }))
+    );
+    assert_eq!(
+        KeepaliveReply::decode(&foreign),
+        Err(KeepaliveReplyError::Frame(FrameError::ForeignKey))
+    );
 }
 
 #[test]
