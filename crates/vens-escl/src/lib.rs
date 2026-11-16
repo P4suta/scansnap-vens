@@ -3,4 +3,5 @@
 #![no_std]
 
 pub mod route;
+pub mod settings;
 pub mod uuid;
