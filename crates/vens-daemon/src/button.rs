@@ -57,7 +57,7 @@ enum Work<T> {
     Stop,
 }
 
-fn await_work<T>(
+fn await_work<T: Report>(
     scanner: &mut Scanner,
     recent: &mut RecentPresses,
     jobs: &Receiver<T>,
@@ -68,7 +68,6 @@ fn await_work<T>(
             Ok(Trigger::Waiting) => {}
             Ok(Trigger::Pressed) => return Work::Pressed,
             Ok(Trigger::PoweredOff) => {
-                *recent = RecentPresses::default();
                 log("the scanner is turning off");
                 return Work::Reconnect;
             }
@@ -82,10 +81,25 @@ fn await_work<T>(
             }
         }
         match jobs.recv_timeout(POLL_INTERVAL) {
-            Ok(report) => return Work::Escl(report),
+            Ok(mut report) => {
+                if report.client_waiting() {
+                    return Work::Escl(report);
+                }
+                report.report(JobEvent::Abandoned { detail: None });
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Work::Stop,
         }
+    }
+}
+
+fn acquire_for_job<T: Report>(network: &mut SystemNetwork, target: Ipv4Addr, mut report: T) {
+    if !report.client_waiting() {
+        return report.report(JobEvent::Abandoned { detail: None });
+    }
+    match acquire(network, target) {
+        Ok(scanner) => run_reserved(scanner, &mut report),
+        Err((refusal, detail)) => report.report(JobEvent::Refused { refusal, detail }),
     }
 }
 
@@ -128,10 +142,10 @@ pub(crate) fn run<T: Report>(
     loop {
         let mut scanner = match acquire(&mut network, target) {
             Ok(scanner) => scanner,
-            Err((refusal, detail)) => {
+            Err((_, detail)) => {
                 log(&format!("can't wait for the Scan button: {detail}"));
                 match jobs.recv_timeout(RETRY_INTERVAL) {
-                    Ok(mut report) => report.report(JobEvent::Refused { refusal, detail }),
+                    Ok(report) => acquire_for_job(&mut network, target, report),
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
@@ -149,6 +163,7 @@ pub(crate) fn run<T: Report>(
                 if matches!(work, Work::Stop) {
                     return;
                 }
+                recent = RecentPresses::default();
             }
         }
     }

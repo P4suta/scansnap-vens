@@ -149,13 +149,13 @@ fn get(port: u16, path: &str) -> Option<Answer> {
 }
 
 fn post(port: u16, path: &str, body: &str) -> Option<Answer> {
-    exchange(
-        port,
-        format!(
-            "POST {path} HTTP/1.1\r\nHost: bridge\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .as_bytes(),
+    exchange(port, post_request(path, body).as_bytes())
+}
+
+fn post_request(path: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: bridge\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     )
 }
 
@@ -331,7 +331,7 @@ fn four_silent_connections_leave_an_acceptor_for_another_client() {
 }
 
 #[test]
-fn a_disconnected_job_request_frees_the_bridge_for_the_next_client() {
+fn a_job_that_times_out_before_reservation_gets_503_and_frees_the_bridge() {
     struct Gated {
         first: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
     }
@@ -352,25 +352,28 @@ fn a_disconnected_job_request_frees_the_bridge_for_the_next_client() {
         let (started, queued) = mpsc::channel();
         let (proceed, hold) = mpsc::channel();
         let ([port], log) = start_with(
-            CONFIG,
+            Config {
+                write_timeout: Duration::from_millis(300),
+                ..CONFIG
+            },
             Gated {
                 first: Some((started, hold)),
             },
         )?;
         let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).ok()?;
-        write!(
-            client,
-            "POST /eSCL/ScanJobs HTTP/1.1\r\nHost: bridge\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{SETTINGS}",
-            SETTINGS.len()
-        )
-        .ok()?;
+        client.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        client
+            .write_all(post_request("/eSCL/ScanJobs", SETTINGS).as_bytes())
+            .ok()?;
         queued.recv_timeout(Duration::from_secs(5)).ok()?;
-        client.shutdown(Shutdown::Both).ok()?;
-        drop(client);
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).ok()?;
+        let timed_out = parse(&answer)?;
         proceed.send(()).ok()?;
         let lines = lines_until(&log, |line| line.contains("client left"));
         let next = post(port, "/eSCL/ScanJobs", SETTINGS)?;
         Some((
+            (timed_out.code, timed_out.field("location").is_none()),
             lines
                 .iter()
                 .any(|line| line.contains("client left before the scan")),
@@ -378,7 +381,24 @@ fn a_disconnected_job_request_frees_the_bridge_for_the_next_client() {
             next.code,
         ))
     })();
-    assert_eq!(observed, Some((true, false, 201)));
+    assert_eq!(observed, Some(((503, true), true, false, 201)));
+}
+
+#[test]
+fn a_client_that_half_closes_after_its_job_request_gets_the_created_response() {
+    let answer = start([events(ONE_SHEET)].to_vec()).and_then(|(port, _log)| {
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).ok()?;
+        client.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        client
+            .write_all(post_request("/eSCL/ScanJobs", SETTINGS).as_bytes())
+            .ok()?;
+        client.shutdown(Shutdown::Write).ok()?;
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).ok()?;
+        let response = parse(&bytes)?;
+        Some((response.code, response.field("location").is_some()))
+    });
+    assert_eq!(answer, Some((201, true)));
 }
 
 #[test]

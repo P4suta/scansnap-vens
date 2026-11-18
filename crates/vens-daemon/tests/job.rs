@@ -23,6 +23,7 @@ const RESULT: usize = 8;
 const QUALIFIER: usize = 13;
 const ONE_SHEET_FRONT_IMAGE: usize = 76;
 const ONE_SHEET_LAST_SENSE: usize = 96;
+const ONE_SHEET_RELEASE_REPLY: usize = 100;
 /// The height in the frame header of the recorded front image, after the two leading bytes and the comment segment.
 const FRAME_HEIGHT: usize = 28;
 
@@ -119,7 +120,7 @@ fn a_recorded_stack_reports_the_reserve_each_page_and_the_end() {
 #[test]
 fn a_client_that_departs_before_reserve_or_declines_creation_gets_no_pages() {
     struct Closed {
-        waiting: bool,
+        waiting_checks: u8,
         reserved: bool,
         reports: Vec<JobEvent>,
     }
@@ -129,8 +130,10 @@ fn a_client_that_departs_before_reserve_or_declines_creation_gets_no_pages() {
             self.reports.push(event);
         }
 
-        fn client_waiting(&self) -> bool {
-            self.waiting
+        fn client_waiting(&mut self) -> bool {
+            let remaining = self.waiting_checks;
+            self.waiting_checks = remaining.saturating_sub(1);
+            remaining > 0
         }
 
         fn created(&mut self) -> bool {
@@ -139,21 +142,30 @@ fn a_client_that_departs_before_reserve_or_declines_creation_gets_no_pages() {
         }
     }
 
-    let outcome = |waiting| {
-        let mut network = FixtureNetwork::new(events(ONE_SHEET))?;
+    let outcome = |waiting_checks, script| {
+        let mut network = FixtureNetwork::new(script)?;
         let mut report = Closed {
-            waiting,
+            waiting_checks,
             reserved: false,
             reports: Vec::new(),
         };
         run_job(&mut network, Ipv4Addr::BROADCAST, &mut report);
-        Some((
-            report.reserved,
-            matches!(report.reports.as_slice(), [JobEvent::Abandoned { .. }]),
-        ))
+        match report.reports.as_slice() {
+            [JobEvent::Abandoned { detail }] => Some((report.reserved, detail.is_some())),
+            _ => None,
+        }
     };
-    assert_eq!(outcome(false), Some((false, true)));
-    assert_eq!(outcome(true), Some((true, true)));
+    let occupied = changed(ONE_SHEET, RESERVE_REPLY, RESULT, &(-4_i32).to_be_bytes());
+    assert_eq!(outcome(0, occupied.clone()), Some((false, false)));
+    assert_eq!(outcome(1, occupied), Some((false, false)));
+    assert_eq!(outcome(3, events(ONE_SHEET)), Some((true, false)));
+    let refused_release = changed(
+        ONE_SHEET,
+        ONE_SHEET_RELEASE_REPLY,
+        RESULT,
+        &(-1_i32).to_be_bytes(),
+    );
+    assert_eq!(outcome(3, refused_release), Some((true, true)));
 }
 
 #[test]

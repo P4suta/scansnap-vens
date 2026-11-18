@@ -92,7 +92,7 @@ impl Network for Scripted {
         })
     }
 
-    fn keepalive(&mut self, discovery: Air) -> Result<Air, Down> {
+    fn keepalive(&mut self, discovery: Air, _: Ipv4Addr) -> Result<Air, Down> {
         Ok(Air {
             nonblocking: true,
             ..discovery
@@ -155,7 +155,7 @@ fn recorded_run() -> Observed {
         let mut control = network.connect(endpoint(53219), Connection::Control)?;
         command.receive(&mut one)?;
         control.receive(&mut two)?;
-        let keepalive = network.keepalive(discovery)?;
+        let keepalive = network.keepalive(discovery, *endpoint(52217).ip())?;
         Ok(Some(keepalive.into_port().nonblocking))
     })();
     let nonblocking = outcome.as_ref().ok().copied().flatten();

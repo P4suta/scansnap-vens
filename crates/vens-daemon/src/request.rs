@@ -23,13 +23,64 @@ fn value<'a>(root: Node<'a, '_>, namespace: &str, name: &str) -> Option<&'a str>
         .map(str::trim)
 }
 
+fn token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn after_parameter_value(value: &str) -> Option<&str> {
+    let Some(quoted) = value.strip_prefix('"') else {
+        let length = value.bytes().take_while(|&byte| token_byte(byte)).count();
+        return if length == 0 {
+            None
+        } else {
+            value.get(length..)
+        };
+    };
+    let mut escaped = false;
+    for (offset, byte) in quoted.bytes().enumerate() {
+        if (byte < b' ' && byte != b'\t') || byte == 0x7f {
+            return None;
+        }
+        match (escaped, byte) {
+            (true, _) => escaped = false,
+            (false, b'\\') => escaped = true,
+            (false, b'"') => return quoted.get(offset.saturating_add(1)..),
+            (false, _) => {}
+        }
+    }
+    None
+}
+
 fn xml_media_type(content_type: Option<&str>) -> bool {
-    content_type.is_some_and(|media| {
-        let essence = media.split_once(';').map_or(media, |(essence, _)| essence);
-        XML_TYPES
-            .iter()
-            .any(|xml| essence.trim().eq_ignore_ascii_case(xml))
-    })
+    let Some(media) = content_type.map(|value| value.trim_matches([' ', '\t'])) else {
+        return false;
+    };
+    let (essence, mut remaining) = media.split_at(media.find(';').unwrap_or(media.len()));
+    if !XML_TYPES.iter().any(|xml| {
+        essence
+            .trim_end_matches([' ', '\t'])
+            .eq_ignore_ascii_case(xml)
+    }) {
+        return false;
+    }
+    while let Some(parameter) = remaining.strip_prefix(';') {
+        let parameter = parameter.trim_start_matches([' ', '\t']);
+        if parameter.is_empty() || parameter.starts_with(';') {
+            remaining = parameter;
+            continue;
+        }
+        let Some((name, value)) = parameter.split_once('=') else {
+            return false;
+        };
+        if name.is_empty() || !name.bytes().all(token_byte) {
+            return false;
+        }
+        let Some(rest) = after_parameter_value(value) else {
+            return false;
+        };
+        remaining = rest.trim_start_matches([' ', '\t']);
+    }
+    remaining.is_empty()
 }
 
 fn scan_settings(request: &HttpRequest) -> Result<Result<JobSettings, Unsupported>, Unreadable> {

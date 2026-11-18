@@ -224,8 +224,9 @@ pub fn open<N: Network>(
     let control_stream = connect(network, control_endpoint, Connection::Control)?;
     let control = ControlChannel::open(control_stream).map_err(OpenFailure::Control)?;
     let mut clock = network.clock();
+    let scanner_address = Ipv4Addr::from(found.reply.address().octets());
     let keepalive_port = network
-        .keepalive(found.discovery)
+        .keepalive(found.discovery, scanner_address)
         .map_err(OpenFailure::Keepalive)?;
     let keepalive = DatagramKeepalive::new(
         keepalive_port,
@@ -234,7 +235,7 @@ pub fn open<N: Network>(
         clock.now(),
     );
     Ok(Connected {
-        scanner: Ipv4Addr::from(found.reply.address().octets()),
+        scanner: scanner_address,
         host: Host {
             mac: HOST_MAC,
             address: found.local,
@@ -350,6 +351,9 @@ impl ReservedScanner<SystemNetwork> {
     /// Returns a trigger socket error that prevents listening.
     pub fn poll_trigger(&mut self, recent: &mut RecentPresses) -> io::Result<Trigger> {
         let now = self.connected.clock.now();
+        if now.millis().saturating_sub(self.last_answer.millis()) >= RESERVE_TIMEOUT_MILLIS {
+            return Ok(Trigger::ReserveExpired);
+        }
         let replies = self.connected.keepalive.replies();
         self.connected.keepalive.tick(now);
         if self.connected.keepalive.replies() != replies {
@@ -374,11 +378,7 @@ impl ReservedScanner<SystemNetwork> {
                 Some(ButtonEvent::Press(_)) | None => {}
             }
         }
-        if now.millis().saturating_sub(self.last_answer.millis()) >= RESERVE_TIMEOUT_MILLIS {
-            Ok(Trigger::ReserveExpired)
-        } else {
-            Ok(Trigger::Waiting)
-        }
+        Ok(Trigger::Waiting)
     }
 }
 

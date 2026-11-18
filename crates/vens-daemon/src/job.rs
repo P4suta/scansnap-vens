@@ -42,7 +42,7 @@ pub enum JobEvent {
 pub trait Report {
     fn report(&mut self, event: JobEvent);
 
-    fn client_waiting(&self) -> bool {
+    fn client_waiting(&mut self) -> bool {
         true
     }
 
@@ -166,6 +166,9 @@ where
     N::Error: Debug,
     T: Report,
 {
+    if !report.client_waiting() {
+        return abandon_reserved(scanner, report);
+    }
     match scanner.prepare().map(|prepared| prepared.paper()) {
         Ok(PaperPath::TopChute) => scan_reserved(scanner, report),
         Ok(paper @ (PaperPath::FrontSlot | PaperPath::Absent)) => {
@@ -179,18 +182,27 @@ where
     }
 }
 
+fn abandon_reserved<N, T>(reserved: ReservedScanner<N>, report: &mut T)
+where
+    N: Network,
+    N::Error: Debug,
+    T: Report,
+{
+    let detail = reserved
+        .release()
+        .err()
+        .map(|error| format!("release failed: {error:?}"));
+    report.report(JobEvent::Abandoned { detail });
+}
+
 fn scan_reserved<N, T>(reserved: ReservedScanner<N>, report: &mut T)
 where
     N: Network,
     N::Error: Debug,
     T: Report,
 {
-    if !report.created() {
-        let detail = reserved
-            .release()
-            .err()
-            .map(|error| format!("release failed: {error:?}"));
-        return report.report(JobEvent::Abandoned { detail });
+    if !report.client_waiting() || !report.created() {
+        return abandon_reserved(reserved, report);
     }
     let run = reserved.scan(&mut Pages {
         report: &mut *report,

@@ -14,12 +14,18 @@ Replace the example address with the address that discovery reports.
 When the daemon logs `waiting for the Scan button`, press Scan once.
 Each press saves the front and back of every sheet to one Portable Document Format (PDF) file, in feed order.
 The daemon takes a reservation while it waits and shares it with eSCL clients.
+The worker discards any press notifications that arrive during a scan.
 Use the scanner from ScanSnap Home after you stop the daemon and the scanner releases its reservation.
+
+The button notifications use unauthenticated User Datagram Protocol (UDP) messages.
+Run the bridge on a trusted network segment and restrict access to its UDP trigger socket to the scanner.
 
 Use the Paperless-ngx consumption directory as the output folder for automatic import.
 [Paperless-ngx usage](https://docs.paperless-ngx.com/usage/#the-consumption-directory)
 
-Give the Paperless-ngx process read access to the resulting files.
+On Unix, each new PDF gives read access to the account that runs `vensd`.
+Run `vensd` and the Paperless-ngx consumer with the same effective user ID.
+Grant that user permission to create and remove files in the consumption directory.
 The daemon writes a temporary file with a `.part` suffix, then publishes the complete file under a unique `.pdf` name in the same directory.
 Each image keeps its original orientation.
 

@@ -124,6 +124,7 @@ fn authorities_allow_ip_addresses_and_local_names() {
         "[::1]:8090",
         "Bridge.LOCAL.:8090",
         "host.orb.internal",
+        "scanner.home.arpa:8090",
     ];
     let refused = [
         "",
@@ -131,13 +132,14 @@ fn authorities_allow_ip_addresses_and_local_names() {
         "scanner.local.example.org",
         "scanner.local:wrong",
         "scanner..local",
+        "scanner.home.arpa.example.org",
     ];
     let status = |host| {
         read(format!("GET /eSCL/ScannerStatus HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
             .map(|_| ())
     };
-    assert_eq!(accepted.map(status), [Ok(()); 5]);
-    assert_eq!(refused.map(status), [Err(ReadError::Malformed); 5]);
+    assert_eq!(accepted.map(status), [Ok(()); 6]);
+    assert_eq!(refused.map(status), [Err(ReadError::Malformed); 6]);
 }
 
 #[test]

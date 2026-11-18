@@ -101,7 +101,7 @@ fn system_network_round() -> io::Result<SystemRound> {
     let (_trigger, port) = network.open_trigger(local)?;
     let time = network.local_time();
     let discovery = network.open_discovery()?;
-    let mut keepalive = network.keepalive(discovery)?;
+    let mut keepalive = network.keepalive(discovery, Ipv4Addr::LOCALHOST)?;
     let mut buffer = [0; 8];
     let started = Instant::now();
     let silence = keepalive.receive(&mut buffer)?;

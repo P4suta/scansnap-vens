@@ -2,7 +2,7 @@ use std::{
     fmt,
     fs::OpenOptions,
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
     path::PathBuf,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -28,6 +28,7 @@ const ANY_PORT: u16 = 0;
 const DISCARD_PORT: u16 = 9;
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const ROUTE_PROBE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+const UDP_RECEIVE_ATTEMPTS: usize = 16;
 
 /// Sleeps through each pause and reads the time elapsed since its creation from the monotonic clock.
 #[derive(Debug)]
@@ -131,7 +132,10 @@ impl PageSink for DirectorySink {
 }
 
 #[derive(Debug)]
-pub struct UdpPort(UdpSocket);
+pub struct UdpPort {
+    socket: UdpSocket,
+    scanner: Option<Ipv4Addr>,
+}
 
 impl UdpPort {
     /// # Errors
@@ -141,7 +145,10 @@ impl UdpPort {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, ANY_PORT))?;
         socket.set_broadcast(true)?;
         socket.set_read_timeout(Some(deadline))?;
-        Ok(Self(socket))
+        Ok(Self {
+            socket,
+            scanner: None,
+        })
     }
 
     /// Turns the port into one whose receive returns at once, for keepalive ticks between commands.
@@ -150,7 +157,7 @@ impl UdpPort {
     ///
     /// Fails when the socket can't change its mode.
     pub fn into_nonblocking(self) -> io::Result<Self> {
-        self.0.set_nonblocking(true)?;
+        self.socket.set_nonblocking(true)?;
         Ok(self)
     }
 }
@@ -159,22 +166,32 @@ impl Datagram for UdpPort {
     type Error = io::Error;
 
     fn send(&mut self, frame: &[u8], target: SocketAddrV4) -> io::Result<()> {
-        self.0.send_to(frame, target).map(|_| ())
+        self.socket.send_to(frame, target).map(|_| ())
     }
 
     fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<usize>> {
-        match self.0.recv_from(buffer) {
-            Ok((length, _)) => Ok(Some(length)),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
+        for _ in 0..UDP_RECEIVE_ATTEMPTS {
+            match self.socket.recv_from(buffer) {
+                Ok((length, peer))
+                    if self
+                        .scanner
+                        .is_none_or(|scanner| peer.ip() == IpAddr::V4(scanner)) =>
+                {
+                    return Ok(Some(length));
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
+        Ok(None)
     }
 }
 
@@ -260,8 +277,10 @@ impl Network for SystemNetwork {
         UdpPort::open(self.probe_interval)
     }
 
-    fn keepalive(&mut self, discovery: UdpPort) -> io::Result<UdpPort> {
-        discovery.into_nonblocking()
+    fn keepalive(&mut self, discovery: UdpPort, scanner: Ipv4Addr) -> io::Result<UdpPort> {
+        let mut port = discovery.into_nonblocking()?;
+        port.scanner = Some(scanner);
+        Ok(port)
     }
 
     fn open_trigger(&mut self, local: Ipv4Address) -> io::Result<(UdpSocket, Port)> {
@@ -290,5 +309,31 @@ impl Network for SystemNetwork {
 
     fn clock(&mut self) -> SleepingClock {
         SleepingClock::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Datagram, Duration, Ipv4Addr, Network, SystemNetwork, UdpSocket, io};
+
+    fn receive_keepalive(scanner: Ipv4Addr) -> io::Result<Option<usize>> {
+        let timeout = Duration::from_secs(1);
+        let mut network = SystemNetwork::new(timeout, timeout);
+        let discovery = network.open_discovery()?;
+        let destination = (Ipv4Addr::LOCALHOST, discovery.socket.local_addr()?.port());
+        let mut port = network.keepalive(discovery, scanner)?;
+        port.socket.set_nonblocking(false)?;
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        sender.send_to(b"reply", destination)?;
+        port.receive(&mut [0; 16])
+    }
+
+    #[test]
+    fn the_keepalive_port_only_accepts_the_selected_scanner() {
+        assert_eq!(receive_keepalive(Ipv4Addr::LOCALHOST).ok(), Some(Some(5)));
+        assert_eq!(
+            receive_keepalive(Ipv4Addr::new(192, 0, 2, 7)).ok(),
+            Some(None)
+        );
     }
 }

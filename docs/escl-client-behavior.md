@@ -29,13 +29,16 @@ sane-airscan [resolves the `Location` of a new job](https://github.com/alexpevzn
 A path in `Location` suffices, and AirSane's path served Image Capture in [AirSane issue 45](https://github.com/SimulPiscator/AirSane/issues/45).
 sane-airscan [retries a job request after 503](https://github.com/alexpevzner/sane-airscan/blob/689a6c660508fa94127318df8c6d6987e3d394cc/airscan-escl.c#L1249-L1312) up to ten times, one second apart.
 The bridge uses 503 for a busy scanner and 409 for a fault that a retry can't fix, as [go-mfp does](https://github.com/OpenPrinting/go-mfp/blob/b228e403d58ca8b70c0e279cb7d4ceeaff67be0c/proto/escl/abstractserver.go#L282-L298).
+A job request that runs out of time before the worker can respond also gets 503.
 On 2026-11-18 the bridge returned 503 while ScanSnap Home on Windows held the reservation.
 After ScanSnap Home exited, the same bridge accepted another job and returned both sides of the sheet.
 The log in AirSane issue 45 shows Image Capture waiting about five seconds for a held `NextDocument` answer.
 The bridge holds that request until a page arrives, the job ends, the client disconnects, or the wait expires.
+A matching `DELETE` ends the pending request with 404.
+A newer `NextDocument` request ends the older one with 503 `Superseded`.
 The bridge counts a page after the socket accepts the whole response and offers the same page again after a failed write.
-An observed job fault stays visible for the feeder hint interval.
-An unobserved fault on the current job stays visible after the client takes its last page.
+The bridge keeps a drained job fault until the socket accepts the whole fault response.
+The fault then stays visible for the feeder hint interval.
 
 On 2026-11-18 Image Capture sent `Content-Type: text/xml` and saved both sides of an A4 sheet as images of 2592 by 3648 pixels.
 The bridge accepts `text/xml` and `application/xml` for job requests, following the media types in [RFC 7303](https://www.rfc-editor.org/rfc/rfc7303#section-9).
@@ -47,6 +50,7 @@ The worker then resumed waiting for the Scan button.
 sane-airscan [sends `Connection: close`](https://github.com/alexpevzner/sane-airscan/blob/689a6c660508fa94127318df8c6d6987e3d394cc/airscan-http.c#L2253-L2270) with every request.
 The bridge closes each connection after one answer, as [RFC 9112, section 9.3](https://www.rfc-editor.org/rfc/rfc9112#section-9.3) describes.
 The bridge accepts numeric addresses, local hostnames, and `host.orb.internal` in the request authority.
+Local hostnames include the `home.arpa` domain described in [RFC 8375](https://www.rfc-editor.org/rfc/rfc8375.html#section-4).
 An acceptor delegates each connection to a bounded set of workers with separate request, response wait, and write deadlines.
 sane-airscan [reads the `ty`, `uuid`, and `rs` keys](https://github.com/alexpevzner/sane-airscan/blob/689a6c660508fa94127318df8c6d6987e3d394cc/airscan-mdns.c#L586-L630) of the text record.
 The record puts `txtvers` first, as [RFC 6763, section 6.7](https://www.rfc-editor.org/rfc/rfc6763#section-6.7) recommends.

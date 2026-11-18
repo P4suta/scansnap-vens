@@ -1,16 +1,19 @@
 use std::{
+    convert::Infallible,
     fmt::Debug,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread::{self, Scope},
     time::{Duration, Instant},
 };
 
 use vens_core::jpeg::{components, frame_size};
 use vens_escl::{
-    bridge::{Bridge, Effect, Input, Moment, Refusal, Request, Response, Side},
+    bridge::{
+        Bridge, Conflict, Effect, Input, Moment, Refusal, Request, Response, Side, Unavailable,
+    },
     uuid::Uuid,
 };
 use vens_net::{host::SystemNetwork, network::Network};
@@ -67,17 +70,19 @@ struct JobRequest {
     body: String,
 }
 
+type ConnectionSlot = Sender<Infallible>;
+
 struct Responder {
     line: String,
     job: Option<JobRequest>,
     reply: Sender<Reply>,
-    starter: Option<TcpStream>,
+    starter: Option<Receiver<()>>,
 }
 
 enum Acknowledge {
     None,
-    Created(Sender<bool>),
     Page { id: Uuid, events: Sender<Event> },
+    Fault { id: Uuid, events: Sender<Event> },
 }
 
 struct Reply {
@@ -88,9 +93,6 @@ struct Reply {
 impl Reply {
     fn written(&mut self, success: bool) {
         match std::mem::replace(&mut self.acknowledge, Acknowledge::None) {
-            Acknowledge::Created(decision) => {
-                let _ = decision.send(success);
-            }
             Acknowledge::Page { id, events } => {
                 let returned = if success {
                     None
@@ -103,7 +105,10 @@ impl Reply {
                 };
                 let _ = events.send(Event::Transfer { id, returned });
             }
-            Acknowledge::None => {}
+            Acknowledge::Fault { id, events } if success => {
+                let _ = events.send(Event::FaultWritten(id));
+            }
+            Acknowledge::None | Acknowledge::Fault { .. } => {}
         }
     }
 }
@@ -118,20 +123,20 @@ enum Event {
     Request {
         request: Request,
         responder: Responder,
+        slot: ConnectionSlot,
     },
     Job(JobEvent),
-    Creation(Sender<bool>),
     Transfer {
         id: Uuid,
         returned: Option<Vec<u8>>,
     },
-    Line(String),
+    FaultWritten(Uuid),
+    Line(String, Option<ConnectionSlot>),
 }
 
 struct ToOwner {
     events: Sender<Event>,
-    peer: Option<TcpStream>,
-    timeout: Duration,
+    created: Receiver<()>,
 }
 
 impl Report for ToOwner {
@@ -139,21 +144,21 @@ impl Report for ToOwner {
         let _ = self.events.send(Event::Job(event));
     }
 
-    fn client_waiting(&self) -> bool {
-        self.peer.as_ref().is_none_or(peer_waiting)
+    fn client_waiting(&mut self) -> bool {
+        self.created.try_recv() == Err(TryRecvError::Empty)
     }
 
     fn created(&mut self) -> bool {
-        let (decision, observed) = mpsc::channel();
-        let delivered = self.events.send(Event::Creation(decision)).is_ok()
-            && observed.recv_timeout(self.timeout) == Ok(true);
-        self.peer = None;
-        delivered
+        self.events.send(Event::Job(JobEvent::Reserved)).is_ok() && self.created.recv().is_ok()
     }
 }
 
 fn line(events: &Sender<Event>, text: String) {
-    let _ = events.send(Event::Line(text));
+    let _ = events.send(Event::Line(text, None));
+}
+
+fn connection_line(events: &Sender<Event>, text: String, slot: ConnectionSlot) {
+    let _ = events.send(Event::Line(text, Some(slot)));
 }
 
 /// A connection whose reads share one deadline, so a client can't stretch a request by trickling its bytes.
@@ -201,7 +206,7 @@ impl Write for Deadline<'_> {
 
 fn peer_waiting(stream: &TcpStream) -> bool {
     match stream.peek(&mut [0_u8; 1]) {
-        Ok(read) => read != 0,
+        Ok(_) => true,
         Err(error) => matches!(
             error.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
@@ -209,22 +214,50 @@ fn peer_waiting(stream: &TcpStream) -> bool {
     }
 }
 
-fn await_reply(answers: &Receiver<Reply>, stream: &TcpStream, timeout: Duration) -> Option<Reply> {
+fn await_reply(
+    answers: &Receiver<Reply>,
+    stream: &TcpStream,
+    timeout: Duration,
+) -> Result<Reply, RecvTimeoutError> {
     let started = Instant::now();
     loop {
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return None;
+            return Err(RecvTimeoutError::Timeout);
         }
         match answers.recv_timeout(remaining.min(PEER_POLL)) {
-            Ok(reply) => return Some(reply),
+            Ok(reply) => return Ok(reply),
             Err(RecvTimeoutError::Timeout) if peer_waiting(stream) => {}
-            Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => return None,
+            Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => {
+                return Err(RecvTimeoutError::Disconnected);
+            }
         }
     }
 }
 
-fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Sender<Event>) {
+fn reject_wait(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    timeout: Duration,
+    events: &Sender<Event>,
+    slot: ConnectionSlot,
+) {
+    let response = Response::<Vec<u8>>::Unavailable(Unavailable::ScannerBusy);
+    let written = write_response(&mut Deadline::new(stream, timeout), &response);
+    let text = match written {
+        Ok(()) => format!("{peer} job request wait expired 503 ScannerBusy"),
+        Err(error) => format!("{peer} job request wait expired, write failed: {error}"),
+    };
+    connection_line(events, text, slot);
+}
+
+fn answer(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    config: Config,
+    events: &Sender<Event>,
+    slot: ConnectionSlot,
+) {
     let request = match read_request(
         &mut Deadline::new(&mut stream, config.request_timeout),
         config.limits,
@@ -244,26 +277,19 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
                 }
                 None => format!("{peer} request ended: {error:?}"),
             };
-            return line(events, text);
+            return connection_line(events, text, slot);
         }
     };
     if let Err(error) = stream.set_read_timeout(Some(PEER_CHECK)) {
-        return line(events, format!("{peer} timeouts failed: {error}"));
+        return connection_line(events, format!("{peer} timeouts failed: {error}"), slot);
     }
     let (reply, answers) = mpsc::channel();
     let escl = escl_request(&request);
-    let starter = if matches!(escl, Request::CreateJob(Ok(_))) {
-        match stream.try_clone() {
-            Ok(pending) => Some(pending),
-            Err(error) => {
-                return line(
-                    events,
-                    format!("{peer} couldn't track the job request: {error}"),
-                );
-            }
-        }
+    let (created, starter) = if matches!(escl, Request::CreateJob(Ok(_))) {
+        let (created, starter) = mpsc::channel();
+        (Some(created), Some(starter))
     } else {
-        None
+        (None, None)
     };
     let job = matches!(escl, Request::CreateJob(_) | Request::Malformed).then(|| JobRequest {
         client: format!(
@@ -290,34 +316,37 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
         .send(Event::Request {
             request: escl,
             responder,
+            slot: slot.clone(),
         })
         .is_err()
     {
         return;
     }
-    let Some(mut reply) = await_reply(&answers, &stream, config.write_timeout) else {
-        return;
+    let mut reply = match await_reply(&answers, &stream, config.write_timeout) {
+        Ok(reply) => reply,
+        Err(error) => {
+            let job_timed_out = error == RecvTimeoutError::Timeout && created.is_some();
+            drop(answers);
+            drop(created);
+            if job_timed_out {
+                reject_wait(&mut stream, peer, config.write_timeout, events, slot);
+            }
+            return;
+        }
     };
-    let written = if matches!(reply.acknowledge, Acknowledge::None) || peer_waiting(&stream) {
-        write_response(
-            &mut Deadline::new(&mut stream, config.write_timeout),
-            &reply.response,
-        )
-    } else {
-        Err(io::Error::from(io::ErrorKind::BrokenPipe))
-    };
-    if let Err(error) = &written {
-        line(events, format!("{peer} write failed: {error}"));
+    let written = write_response(
+        &mut Deadline::new(&mut stream, config.write_timeout),
+        &reply.response,
+    );
+    if let Err(error) = written {
+        return connection_line(events, format!("{peer} write failed: {error}"), slot);
     }
-    reply.written(written.is_ok());
-}
-
-struct ConnectionSlot(Sender<()>);
-
-impl Drop for ConnectionSlot {
-    fn drop(&mut self) {
-        let _ = self.0.send(());
+    if matches!(reply.response, Response::Created(_))
+        && let Some(created) = created
+    {
+        let _ = created.send(());
     }
+    reply.written(true);
 }
 
 fn accept<'scope>(
@@ -326,26 +355,29 @@ fn accept<'scope>(
     config: Config,
     events: &Sender<Event>,
 ) {
-    let (completion, completed) = mpsc::channel();
-    let mut active = 0_usize;
+    let mut slots: Vec<Receiver<Infallible>> = Vec::with_capacity(CONNECTIONS_PER_LISTENER);
     loop {
         match listener.accept() {
             Ok((stream, peer)) => {
-                active = active.saturating_sub(completed.try_iter().count());
-                if active >= CONNECTIONS_PER_LISTENER {
+                slots.retain(|slot| slot.try_recv() == Err(TryRecvError::Empty));
+                if slots.len() >= CONNECTIONS_PER_LISTENER {
                     continue;
                 }
+                let (slot, held) = mpsc::channel();
+                slots.push(held);
                 let messages = events.clone();
-                let completion = completion.clone();
+                let handler_slot = slot.clone();
                 let spawned = thread::Builder::new()
                     .name("vensd request".to_owned())
                     .spawn_scoped(scope, move || {
-                        let _slot = ConnectionSlot(completion);
-                        answer(stream, peer, config, &messages);
+                        answer(stream, peer, config, &messages, handler_slot);
                     });
-                match spawned {
-                    Ok(_) => active = active.saturating_add(1),
-                    Err(error) => line(events, format!("a request thread couldn't start: {error}")),
+                if let Err(error) = spawned {
+                    connection_line(
+                        events,
+                        format!("a request thread couldn't start: {error}"),
+                        slot,
+                    );
                 }
             }
             Err(error) => {
@@ -413,12 +445,15 @@ fn reason<P>(response: &Response<P>) -> String {
 
 type OwnerInput = Input<Responder, Vec<u8>>;
 
-fn input<L: Log>(event: Event, log: &mut L) -> Option<(OwnerInput, Option<Sender<bool>>)> {
+fn input<L: Log>(event: Event, log: &mut L) -> Option<OwnerInput> {
     let input = match event {
-        Event::Request { request, responder } => Input::Request { request, responder },
-        Event::Creation(decision) => {
-            log.record("job reserved the scanner");
-            return Some((Input::Reserved, Some(decision)));
+        Event::Request {
+            request,
+            responder,
+            slot,
+        } => {
+            drop(slot);
+            Input::Request { request, responder }
         }
         Event::Job(JobEvent::Reserved) => {
             log.record("job reserved the scanner");
@@ -438,34 +473,36 @@ fn input<L: Log>(event: Event, log: &mut L) -> Option<(OwnerInput, Option<Sender
             Input::Page { side, page }
         }
         Event::Transfer { id, returned } => Input::PageWritten { id, returned },
+        Event::FaultWritten(id) => Input::FaultWritten(id),
         Event::Job(JobEvent::Finished { ending, detail }) => {
             let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
             log.record(&format!("job finished: {ending:?}{detail}"));
             Input::Finished(ending)
         }
-        Event::Line(text) => {
+        Event::Line(text, slot) => {
             log.record(&text);
+            drop(slot);
             return None;
         }
     };
-    Some((input, None))
+    Some(input)
 }
 
 fn respond<L: Log>(responder: &Responder, reply: Reply, log: &mut L) {
     let (code, _) = status(&reply.response);
+    let reason = reason(&reply.response);
+    if responder.reply.send(reply).is_err() {
+        log.record(&format!("{} response receiver closed", responder.line));
+        return;
+    }
     let client = responder
         .job
         .as_ref()
         .map_or_else(String::new, |job| format!(" {}", job.client));
-    log.record(&format!(
-        "{} {code}{}{client}",
-        responder.line,
-        reason(&reply.response)
-    ));
+    log.record(&format!("{} {code}{reason}{client}", responder.line));
     if let (400..=599, Some(job)) = (code, &responder.job) {
         log.record(&format!("{} body {:?}", responder.line, job.body));
     }
-    let _ = responder.reply.send(reply);
 }
 
 fn own<'scope, S: Networks, L: Log>(
@@ -477,18 +514,18 @@ fn own<'scope, S: Networks, L: Log>(
     config: Config,
     log: &mut L,
 ) {
-    let started = Instant::now();
+    let epoch = Instant::now();
     let mut bridge = Bridge::<Responder, Vec<u8>, QUEUE>::new(config.uuid, config.seed);
     while let Ok(event) = inbox.recv() {
-        let Some((mut input, mut created)) = input(event, log) else {
+        let Some(mut input) = input(event, log) else {
             continue;
         };
-        let mut peer = if let Input::Request { responder, .. } = &mut input {
+        let mut starter = if let Input::Request { responder, .. } = &mut input {
             responder.starter.take()
         } else {
             None
         };
-        let (next, effects) = bridge.handle(input, now(started));
+        let (next, effects) = bridge.handle(input, now(epoch));
         bridge = next;
         for effect in effects {
             match effect {
@@ -496,14 +533,11 @@ fn own<'scope, S: Networks, L: Log>(
                     responder,
                     response,
                 } => {
-                    let acknowledge = created
-                        .take()
-                        .map_or(Acknowledge::None, Acknowledge::Created);
                     respond(
                         &responder,
                         Reply {
                             response,
-                            acknowledge,
+                            acknowledge: Acknowledge::None,
                         },
                         log,
                     );
@@ -525,15 +559,31 @@ fn own<'scope, S: Networks, L: Log>(
                         log,
                     );
                 }
+                Effect::Fault {
+                    responder,
+                    id,
+                    fault,
+                } => {
+                    respond(
+                        &responder,
+                        Reply {
+                            response: Response::Conflict(Conflict::Failed(fault)),
+                            acknowledge: Acknowledge::Fault {
+                                id,
+                                events: events.clone(),
+                            },
+                        },
+                        log,
+                    );
+                }
                 Effect::Start(_) => {
-                    let Some(peer) = peer.take() else {
+                    let Some(created) = starter.take() else {
                         let _ = events.send(Event::Job(JobEvent::Abandoned { detail: None }));
                         continue;
                     };
                     let report = ToOwner {
                         events: events.clone(),
-                        peer: Some(peer),
-                        timeout: config.write_timeout,
+                        created,
                     };
                     if let Some(worker) = worker {
                         if let Err(mut dropped) = worker.send(report) {

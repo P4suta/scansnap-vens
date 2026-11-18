@@ -32,13 +32,19 @@ fn ignores_the_wrong_size_key_event_and_sequence() {
     if let Some(byte) = foreign.get_mut(4) {
         *byte = 0;
     }
+    let press = event(1, 1);
+    let oversized: Vec<u8> = press.into_iter().chain([0]).collect();
+    assert_eq!(
+        ButtonEvent::decode(&press),
+        NonZeroU8::new(1).map(ButtonEvent::Press)
+    );
     assert_eq!(
         [
             ButtonEvent::decode(&foreign),
             ButtonEvent::decode(&event(1, 0)),
             ButtonEvent::decode(&event(2, 1)),
-            ButtonEvent::decode(&[0; 47]),
-            ButtonEvent::decode(&[0; 49]),
+            ButtonEvent::decode(press.split_last().map_or(&[], |(_, shorter)| shorter)),
+            ButtonEvent::decode(&oversized),
         ],
         [None; 5]
     );

@@ -71,6 +71,19 @@ fn feed<const N: usize>(
                                 });
                                 (bridge, replies)
                             }
+                            Effect::Fault {
+                                responder,
+                                id,
+                                fault,
+                            } => {
+                                let (bridge, _) = bridge
+                                    .handle(Input::FaultWritten(id), Moment::from_millis(millis));
+                                replies.push(Effect::Reply {
+                                    responder,
+                                    response: Response::Conflict(Conflict::Failed(fault)),
+                                });
+                                (bridge, replies)
+                            }
                             effect @ (Effect::Reply { .. } | Effect::Start(_)) => {
                                 replies.push(effect);
                                 (bridge, replies)
@@ -108,7 +121,10 @@ fn status_of<const N: usize>(
             response: Response::Status(status),
             ..
         } => Some(status),
-        Effect::Reply { .. } | Effect::Start(_) | Effect::Transfer { .. } => None,
+        Effect::Reply { .. }
+        | Effect::Start(_)
+        | Effect::Transfer { .. }
+        | Effect::Fault { .. } => None,
     })
 }
 
@@ -118,7 +134,10 @@ fn created(effects: Option<&Effects>) -> Option<Uuid> {
             response: Response::Created(path),
             ..
         } => Some(path.job()),
-        Effect::Reply { .. } | Effect::Start(_) | Effect::Transfer { .. } => None,
+        Effect::Reply { .. }
+        | Effect::Start(_)
+        | Effect::Transfer { .. }
+        | Effect::Fault { .. } => None,
     })
 }
 
@@ -607,6 +626,39 @@ fn a_drained_failure_waits_for_the_clients_next_page_request() {
             Response::Conflict(Conflict::Failed(Fault::Jam))
         ))
     );
+}
+
+#[test]
+fn an_unwritten_fault_still_answers_a_retry_after_the_hint_interval() {
+    check(started::<4>(duplex()).map(|(bridge, id)| {
+        let (waiting, _) = bridge.handle(
+            request(Request::NextDocument(id), "gone"),
+            Moment::from_millis(2),
+        );
+        let (ended, _) = waiting.handle(
+            Input::Finished(Ending::Failed(Fault::Jam)),
+            Moment::from_millis(3),
+        );
+        let retry = HINT_MILLIS.saturating_add(4);
+        let next = request(Request::NextDocument(id), "retry");
+        let (ended, _) = ended.handle(next.clone(), Moment::from_millis(retry));
+        let written = retry.saturating_add(HINT_MILLIS);
+        let (_, replies) = feed(
+            ended,
+            [
+                (written, next.clone()),
+                (written.saturating_add(HINT_MILLIS), next),
+            ],
+        );
+        (
+            replies,
+            [
+                reply("retry", Response::Conflict(Conflict::Failed(Fault::Jam))),
+                reply("retry", Response::NotFound),
+            ]
+            .to_vec(),
+        )
+    }));
 }
 
 #[test]

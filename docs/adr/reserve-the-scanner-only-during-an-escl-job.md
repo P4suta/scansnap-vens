@@ -23,11 +23,12 @@ Holding the reserve continuously would deliver button events, but it would take 
 
 ## Consequences
 
-Button capture needs a separate reservation policy.
+The decision applies to the default mode without `--consume`.
+In capture mode, the worker holds a reservation while waiting for a press or an eSCL job.
+[Coordinate button and eSCL scans in the daemon](coordinate-button-and-escl-scans-in-the-daemon.md)
 
 ## Confirmation
 
-On 2026-11-16 an empty chute got status 409 before any reserve, and sane-airscan and Image Capture each scanned through the bridge.
-On 2026-11-18 the bridge returned status 503 while ScanSnap Home on Windows held the reservation.
-After ScanSnap Home exited, the bridge reserved the scanner and returned both sides of the same sheet.
+On 2026-11-16 an empty chute got 409, and sane-airscan and Image Capture both scanned through the bridge.
+On 2026-11-18 the bridge returned 503 while ScanSnap Home held the reserve and scanned both sides after it exited.
 Reconsider when a release request can take the reserve from ScanSnap Home.

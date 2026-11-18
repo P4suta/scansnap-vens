@@ -81,6 +81,7 @@ pub enum Input<R, P> {
     Refused(Refusal),
     Page { side: Side, page: P },
     PageWritten { id: Uuid, returned: Option<P> },
+    FaultWritten(Uuid),
     Finished(Ending),
 }
 
@@ -127,6 +128,11 @@ pub enum Effect<R, P> {
         id: Uuid,
         page: P,
     },
+    Fault {
+        responder: R,
+        id: Uuid,
+        fault: Fault,
+    },
     /// Starts the job thread, which reports the reserve, each page, and the end.
     Start(JobSettings),
 }
@@ -157,6 +163,17 @@ impl<R, P> Effects<R, P> {
             id,
             page,
         })
+    }
+
+    const fn end(responder: R, id: Uuid, ending: Ending) -> Self {
+        match ending {
+            Ending::Completed => Self::reply(responder, Response::NotFound),
+            Ending::Failed(fault) => Self::one(Effect::Fault {
+                responder,
+                id,
+                fault,
+            }),
+        }
     }
 }
 
@@ -317,13 +334,6 @@ fn job_id(seed: [u8; 16], number: u32) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-const fn end_of<P>(ending: Ending) -> Response<P> {
-    match ending {
-        Ending::Completed => Response::NotFound,
-        Ending::Failed(fault) => Response::Conflict(Conflict::Failed(fault)),
-    }
-}
-
 const fn feeder_after(fault: Fault) -> AdfState {
     match fault {
         Fault::Jam => AdfState::Jam,
@@ -372,6 +382,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Input::PageWritten { id, returned } => {
                 (bridge.page_written(id, returned, now), Effects::none())
             }
+            Input::FaultWritten(id) => (bridge.fault_written(id, now), Effects::none()),
             Input::Finished(ending) => bridge.finished(ending, now),
         }
     }
@@ -621,24 +632,36 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
         self
     }
 
+    fn fault_written(mut self, id: Uuid, now: Moment) -> Self {
+        if let Activity::Busy(job) = &mut self.activity
+            && job.id == id
+            && matches!(job.phase, Phase::Finished(Ending::Failed(_)))
+            && !job.has_pages()
+        {
+            job.fault_observed = true;
+            job.touched = now;
+        }
+        self
+    }
+
     fn finished(mut self, ending: Ending, now: Moment) -> (Self, Effects<R, P>) {
         let Some(job) = self.take_job() else {
             return (self, Effects::none());
         };
         let effects = match job.phase {
             Phase::Scanning { waiter } => {
+                let id = job.id;
                 let ending = match ending {
                     Ending::Completed if job.lost > 0 => Ending::Failed(Fault::Lost),
                     Ending::Completed | Ending::Failed(_) => ending,
                 };
                 self.keep(Job {
                     phase: Phase::Finished(ending),
-                    fault_observed: waiter.is_some(),
                     touched: now,
                     ..job
                 });
                 waiter.map_or_else(Effects::none, |responder| {
-                    Effects::reply(responder, end_of(ending))
+                    Effects::end(responder, id, ending)
                 })
             }
             Phase::Starting(responder) => Effects::reply(
@@ -701,10 +724,9 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             }
             Phase::Finished(ending) => {
                 job.touched = now;
-                job.fault_observed |= page.is_none();
                 let effects = match page {
                     Some(page) => Effects::transfer(responder, id, page),
-                    None => Effects::reply(responder, end_of(ending)),
+                    None => Effects::end(responder, id, ending),
                 };
                 self.keep(Job {
                     phase: Phase::Finished(ending),

@@ -68,7 +68,8 @@ fn port(value: &str) -> bool {
 
 fn local_name(name: &str) -> bool {
     let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
-    let local = name == "host.orb.internal"
+    let local = ["host.orb.internal", "home.arpa"].contains(&name.as_str())
+        || name.ends_with(".home.arpa")
         || name
             .rsplit_once('.')
             .is_none_or(|(_, suffix)| suffix == "local");

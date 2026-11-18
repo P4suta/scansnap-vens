@@ -51,12 +51,16 @@ pub trait Network {
     /// Fails when the discovery port can't open.
     fn open_discovery(&mut self) -> Result<Self::Discovery, Self::Error>;
 
-    /// Turns the discovery port into the keepalive port, whose receive returns at once.
+    /// Turns the discovery port into a nonblocking keepalive port for the selected scanner.
     ///
     /// # Errors
     ///
     /// Fails when the port can't change its mode.
-    fn keepalive(&mut self, discovery: Self::Discovery) -> Result<Self::Keepalive, Self::Error>;
+    fn keepalive(
+        &mut self,
+        discovery: Self::Discovery,
+        scanner: Ipv4Addr,
+    ) -> Result<Self::Keepalive, Self::Error>;
 
     /// Opens the port for button events on `local` and returns its number.
     ///
@@ -120,8 +124,12 @@ impl<N: Network> Network for RecordingNetwork<N> {
         Ok(Recorder::new(port, Channel::Discovery, self.events.clone()))
     }
 
-    fn keepalive(&mut self, discovery: Self::Discovery) -> Result<Self::Keepalive, N::Error> {
-        let port = self.network.keepalive(discovery.into_port())?;
+    fn keepalive(
+        &mut self,
+        discovery: Self::Discovery,
+        scanner: Ipv4Addr,
+    ) -> Result<Self::Keepalive, N::Error> {
+        let port = self.network.keepalive(discovery.into_port(), scanner)?;
         Ok(Recorder::new(port, Channel::Discovery, self.events.clone()))
     }
 
