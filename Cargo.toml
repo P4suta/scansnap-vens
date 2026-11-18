@@ -22,10 +22,10 @@ httparse = "1.10.1"
 pdf-writer = "0.15.0"
 roxmltree = "0.21.2"
 tempfile = "3.27.0"
-vens-core = { path = "crates/vens-core", version = "0.0.0" }
+vens-core = { path = "crates/vens-core", version = "0.1.0" }
 vens-emulator = { path = "fixtures/emulator", version = "0.0.0" }
-vens-escl = { path = "crates/vens-escl", version = "0.0.0" }
-vens-net = { path = "crates/vens-net", version = "0.0.0" }
+vens-escl = { path = "crates/vens-escl", version = "0.1.0" }
+vens-net = { path = "crates/vens-net", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

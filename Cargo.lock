@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "vens-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vens-core",
  "vens-emulator",
@@ -151,11 +151,11 @@ dependencies = [
 
 [[package]]
 name = "vens-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "vens-daemon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "httparse",
  "pdf-writer",
@@ -177,14 +177,14 @@ dependencies = [
 
 [[package]]
 name = "vens-escl"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "roxmltree",
 ]
 
 [[package]]
 name = "vens-net"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vens-core",
 ]
