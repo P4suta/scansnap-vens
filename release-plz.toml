@@ -1,0 +1,52 @@
+[workspace]
+release = false
+release_always = false
+git_only = true
+git_tag_name = "v{{ version }}"
+git_tag_enable = false
+git_release_enable = false
+publish = false
+pr_draft = true
+pr_name = "chore(release): prepare v{{ version }}"
+semver_check = false
+dependencies_update = false
+changelog_update = false
+
+[[package]]
+name = "vens-cli"
+release = true
+
+[[package]]
+name = "vens-core"
+release = true
+
+[[package]]
+name = "vens-daemon"
+release = true
+changelog_update = true
+changelog_path = "./CHANGELOG.md"
+changelog_include = ["vens-cli", "vens-core", "vens-escl", "vens-net"]
+
+[[package]]
+name = "vens-escl"
+release = true
+
+[[package]]
+name = "vens-net"
+release = true
+
+[changelog]
+protect_breaking_commits = true
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+body = '''
+## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, changes in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+
+{% for commit in changes -%}
+{% if commit.breaking %}**Breaking change.**
+{% endif -%}
+{{ commit.message | trim | upper_first | trim_end_matches(pat=".") }}.
+{% endfor %}
+{% endfor %}
+'''

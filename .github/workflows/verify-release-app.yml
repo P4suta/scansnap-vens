@@ -1,0 +1,50 @@
+name: Verify release App access
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-release-app
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify read-only access to the release repository
+    if: github.repository == 'P4suta/scansnap-vens' && github.ref == 'refs/heads/main' && github.ref_protected
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release-proposal
+    steps:
+      - name: Fetch the release-plz App credentials
+        id: credentials
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          doppler-token: ${{ secrets.DOPPLER_TOKEN }}
+          inject-env-vars: false
+      - name: Check the credential inputs
+        env:
+          APP_INPUTS_VALID: >-
+            ${{ steps.credentials.outputs.GITHUB_APP_CLIENT_ID != '' &&
+            steps.credentials.outputs.GITHUB_APP_PRIVATE_KEY != '' &&
+            !startsWith(steps.credentials.outputs.GITHUB_APP_CLIENT_ID, '${') &&
+            !startsWith(steps.credentials.outputs.GITHUB_APP_PRIVATE_KEY, '${') }}
+        run: test "$APP_INPUTS_VALID" = true
+      - name: Mint a read-only token for the repository
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ steps.credentials.outputs.GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ steps.credentials.outputs.GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: scansnap-vens
+          permission-contents: read
+          permission-pull-requests: read
+      - name: Check the repository scope
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          repository="$(gh api installation/repositories --jq 'select(.total_count == 1) | .repositories[0].full_name')"
+          test "$repository" = P4suta/scansnap-vens

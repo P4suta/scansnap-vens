@@ -1,5 +1,14 @@
 # Run the bridge
 
+## Install the commands
+
+Choose the archive for your platform when the [release](https://github.com/P4suta/scansnap-vens/releases) provides one.
+The Linux archive targets x86-64 on Ubuntu 24.04, and the macOS archive targets Apple silicon.
+Unpack the archive and place `vens` and `vensd` in a directory on your path.
+For a source release, use the [source installation commands](../README.md#installation).
+
+## Connect to the scanner
+
 Connect the ScanSnap iX1300 to your local network and pair it once with ScanSnap Home.
 Open the scanner cover and run `vens discover` to find its address.
 In the README command, replace `192.0.2.7` with that address.
@@ -24,3 +33,4 @@ The client notes explain how Image Capture and sane-airscan use the bridge.
 [eSCL client behavior](escl-client-behavior.md)
 
 Run the workspace checks with `mise x -- just check`.
+[Prepare and publish a release](releases.md)

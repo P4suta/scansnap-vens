@@ -1,0 +1,144 @@
+name: Build release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full commit SHA of the protected main branch at dispatch
+        required: true
+        type: string
+      version:
+        description: Product version in Cargo.toml without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    if: github.repository == 'P4suta/scansnap-vens' && github.ref == 'refs/heads/main' && github.ref_protected
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            architecture: x86_64
+          - platform: macos-arm64
+            runner: macos-15
+            architecture: arm64
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      VERSION: ${{ inputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+    steps:
+      - name: Check the requested source and version
+        shell: bash
+        run: |
+          if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" == "$GITHUB_SHA" ]]; then
+            echo "::error::Dispatch with the full commit SHA from protected main"
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Use an X.Y.Z product version"
+            exit 1
+          fi
+          if [[ "$(uname -m)" != "$ARCHITECTURE" ]]; then
+            echo "::error::Expected a native $ARCHITECTURE runner"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: "2026.11.9"
+      - name: Check the locked versions and run the workspace checks
+        shell: bash
+        run: |
+          for package in vens-cli vens-core vens-daemon vens-escl vens-net; do
+            id="$(mise x -- cargo pkgid --locked --package "$package")"
+            id="${id##*#}"
+            if [[ "${id##*@}" != "$VERSION" ]]; then
+              echo "::error::$package does not match the requested version $VERSION"
+              exit 1
+            fi
+          done
+          mise x -- just check
+      - name: Build, archive, and exercise the commands
+        shell: bash
+        run: |
+          work=target/release-candidate
+          bundle="scansnap-vens-${VERSION}-${PLATFORM}"
+          mise x -- cargo build --locked --release --bins -p vens-cli -p vens-daemon --target-dir "$work/build"
+          mkdir -p "$work/$bundle" "$work/assets" "$work/extracted"
+          install -m 0755 "$work/build/release/vens" "$work/build/release/vensd" "$work/$bundle"
+          install -m 0644 LICENSE-APACHE LICENSE-MIT "$work/$bundle"
+          tar -czf "$work/assets/$bundle.tar.gz" -C "$work" "$bundle"
+          tar -xzf "$work/assets/$bundle.tar.gz" -C "$work/extracted"
+          "$work/extracted/$bundle/vens" --help
+          "$work/extracted/$bundle/vensd" --help
+          "$work/extracted/$bundle/vensd" avahi-service > "$work/avahi.service"
+          test -s "$work/avahi.service"
+      - name: Archive the source and its locked dependency inventory
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          output=target/release-candidate/assets
+          source="scansnap-vens-${VERSION}"
+          git archive --format=tar.gz --prefix="$source/" --output="$output/$source.tar.gz" "$SOURCE_SHA"
+          mise install github:anchore/syft@1.57.1
+          mise x github:anchore/syft@1.57.1 -- syft scan dir:. \
+            --override-default-catalogers rust-cargo-lock-cataloger \
+            --exclude './target/**' \
+            --source-name scansnap-vens --source-version "$VERSION" \
+            --output "cyclonedx-json=$output/$source.cdx.json" --quiet
+          jq -e --arg version "$VERSION" '
+            .bomFormat == "CycloneDX" and
+            .metadata.component.name == "scansnap-vens" and
+            .metadata.component.version == $version and
+            (.components | any(.name == "pdf-writer"))
+          ' "$output/$source.cdx.json"
+      - name: Record and verify archive hashes
+        working-directory: target/release-candidate/assets
+        shell: bash
+        run: |
+          shasum -a 256 scansnap-vens-* > "SHA256SUMS.$PLATFORM"
+          shasum -a 256 -c "SHA256SUMS.$PLATFORM"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-candidate-${{ matrix.platform }}
+          path: target/release-candidate/assets/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  attest:
+    name: Attest release candidate
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # Bind the attestation to the selected repository and commit.
+      id-token: write # Request a signing certificate for this workflow.
+      attestations: write # Store the build provenance in GitHub.
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-candidate-*
+          path: candidate
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            candidate/*/scansnap-vens-*
+            candidate/*/SHA256SUMS.*
