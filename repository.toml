@@ -1,0 +1,11 @@
+name = "`scansnap-vens`"
+summary = "Share a ScanSnap iX1300 with eSCL clients over Wi-Fi"
+install = """
+git clone https://github.com/P4suta/scansnap-vens.git
+cd scansnap-vens
+cargo install --locked --path crates/vens-cli
+cargo install --locked --path crates/vens-daemon"""
+usage = "vensd --address 192.0.2.7"
+documentation_index = true
+copyright = "Yasunobu"
+license = "MIT OR Apache-2.0"
