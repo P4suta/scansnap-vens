@@ -14,7 +14,7 @@ cargo install --locked --path crates/vens-daemon
 ## Usage
 
 ```sh
-vensd --address 192.0.2.7
+vensd --address 192.0.2.7 --consume /path/to/consume
 ```
 
 ## Documentation

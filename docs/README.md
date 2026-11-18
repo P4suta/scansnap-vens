@@ -3,7 +3,12 @@
 Connect the ScanSnap iX1300 to your local network and pair it once with ScanSnap Home.
 Open the scanner cover and run `vens discover` to find its address.
 In the README command, replace `192.0.2.7` with that address.
+Replace `/path/to/consume` with an existing writable folder to save one PDF per scan.
+The same daemon can serve eSCL clients while it waits for the physical button.
 The bridge listens on port 8090.
+
+The button guide explains how to use the Paperless-ngx consumption directory.
+[Scan to a folder](button-capture.md)
 
 On Linux, run `vensd avahi-service` to generate the service definition for Avahi.
 Save the output as a `.service` file in `/etc/avahi/services` on the bridge host.

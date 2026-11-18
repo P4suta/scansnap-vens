@@ -1,6 +1,6 @@
 //! The `vensd` command serves by default, and its one subcommand prints the Avahi service file.
 
-use std::{ffi::OsString, net::Ipv4Addr};
+use std::{ffi::OsString, net::Ipv4Addr, path::PathBuf};
 
 use vens_daemon::invocation::{DEFAULT_PORT, DEFAULT_UUID, Invocation, USAGE, UsageError, parse};
 use vens_escl::uuid::Uuid;
@@ -21,6 +21,24 @@ fn no_arguments_serve_with_the_defaults() {
             uuid: DEFAULT_UUID,
         })
     );
+}
+
+#[test]
+fn a_consume_folder_enables_the_button_and_keeps_the_bridge() {
+    assert_eq!(
+        run(&["--consume", "scanned documents", "--port", "9000"]),
+        Ok(Invocation::Capture {
+            folder: PathBuf::from("scanned documents"),
+            port: 9000,
+            target: Ipv4Addr::BROADCAST,
+            uuid: DEFAULT_UUID,
+        })
+    );
+    assert_eq!(
+        run(&["--consume"]),
+        Err(UsageError::MissingValue("--consume"))
+    );
+    assert!(run(&["avahi-service", "--consume", "scans"]).is_err());
 }
 
 #[test]

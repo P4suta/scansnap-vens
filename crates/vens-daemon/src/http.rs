@@ -1,4 +1,7 @@
-use std::io::{self, Read, Write};
+use std::{
+    io::{self, Read, Write},
+    net::{Ipv4Addr, Ipv6Addr},
+};
 
 use httparse::{EMPTY_HEADER, Status};
 use vens_escl::bridge::Response;
@@ -23,7 +26,7 @@ pub struct HttpRequest {
     pub target: String,
     /// The client's `User-Agent` field, which the log shows beside a refused job request.
     pub user_agent: Option<String>,
-    /// The `Content-Type` field, which tells a scan client's body from a browser form.
+    /// The client's declared body format.
     pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
@@ -57,6 +60,49 @@ fn field(headers: &[httparse::Header<'_>], name: &str) -> Option<String> {
         .map(|header| String::from_utf8_lossy(header.value).into_owned())
 }
 
+fn port(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u16>().is_ok()
+}
+
+fn local_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    let local = name == "host.orb.internal"
+        || name
+            .rsplit_once('.')
+            .is_none_or(|(_, suffix)| suffix == "local");
+    local
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn allowed_authority(value: &[u8]) -> bool {
+    let Ok(authority) = str::from_utf8(value) else {
+        return false;
+    };
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        return bracketed.split_once(']').is_some_and(|(host, suffix)| {
+            host.parse::<Ipv6Addr>().is_ok()
+                && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(port))
+        });
+    }
+    let host = match authority.split_once(':') {
+        Some((host, service)) if port(service) => host,
+        Some(_) => return false,
+        None => authority,
+    };
+    host.parse::<Ipv4Addr>().is_ok() || local_name(host)
+}
+
 fn parse_head(bytes: &[u8]) -> Result<Option<Head>, ReadError> {
     let mut headers = [EMPTY_HEADER; MAX_HEADERS];
     let mut request = httparse::Request::new(&mut headers);
@@ -83,12 +129,23 @@ fn parse_head(bytes: &[u8]) -> Result<Option<Head>, ReadError> {
             header.name.eq_ignore_ascii_case("expect")
                 && header.value.eq_ignore_ascii_case(b"100-continue")
         });
-    let hosts = request
+    let mut hosts = request
         .headers
         .iter()
-        .filter(|header| header.name.eq_ignore_ascii_case("host"))
-        .count();
-    if request.version == Some(1) && hosts != 1 {
+        .filter(|header| header.name.eq_ignore_ascii_case("host"));
+    let valid_host = hosts.next().map_or(request.version != Some(1), |header| {
+        allowed_authority(header.value)
+    });
+    if !valid_host || hosts.next().is_some() {
+        return Err(ReadError::Malformed);
+    }
+    if request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("content-type"))
+        .nth(1)
+        .is_some()
+    {
         return Err(ReadError::Malformed);
     }
     let (Some(method), Some(target)) = (request.method, request.path) else {

@@ -125,6 +125,18 @@ pub fn reserve<T: Stream>(
 }
 
 impl Reserved {
+    /// Releases the scanner without starting a job.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the control channel fails or the scanner refuses the release.
+    pub fn release<T: Stream>(
+        self,
+        control: &mut ControlChannel<T>,
+    ) -> Result<(), ControlError<T::Error>> {
+        control.release(Release::new(self.mac))
+    }
+
     /// Runs one job and releases the scanner after it, whatever the job's outcome.
     ///
     /// # Errors
@@ -147,7 +159,7 @@ impl Reserved {
         K: PageSink,
     {
         let scanned = run(command, clock, keepalive, sink, buffer);
-        let released = control.release(Release::new(self.mac));
+        let released = self.release(control);
         match (scanned, released) {
             (Ok(summary), Ok(())) => Ok(summary),
             (Ok(summary), Err(failure)) => Err(JobFailure::Release { summary, failure }),

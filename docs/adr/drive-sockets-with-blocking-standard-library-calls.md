@@ -1,6 +1,6 @@
 ---
 date: 2026-11-16
-status: proposed
+status: accepted
 ---
 
 # Drive sockets with blocking standard library calls
@@ -32,4 +32,4 @@ Reconsider this choice if the bridge must serve many scanners or many clients at
 ## Confirmation
 
 Emulator tests exercise deadlines under a virtual clock.
-The record stays proposed until a hardware scan with a keepalive completes.
+On 2026-11-16 a hardware scan completed with three keepalive replies.

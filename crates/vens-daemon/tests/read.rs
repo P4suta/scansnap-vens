@@ -117,6 +117,38 @@ fn an_http_1_1_request_needs_exactly_one_host() {
 }
 
 #[test]
+fn authorities_allow_ip_addresses_and_local_names() {
+    let accepted = [
+        "localhost",
+        "127.0.0.1:8090",
+        "[::1]:8090",
+        "Bridge.LOCAL.:8090",
+        "host.orb.internal",
+    ];
+    let refused = [
+        "",
+        "scanner.example.org",
+        "scanner.local.example.org",
+        "scanner.local:wrong",
+        "scanner..local",
+    ];
+    let status = |host| {
+        read(format!("GET /eSCL/ScannerStatus HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .map(|_| ())
+    };
+    assert_eq!(accepted.map(status), [Ok(()); 5]);
+    assert_eq!(refused.map(status), [Err(ReadError::Malformed); 5]);
+}
+
+#[test]
+fn a_request_cannot_specify_two_media_types() {
+    assert_eq!(
+        read(b"POST /eSCL/ScanJobs HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/xml\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n"),
+        Err(ReadError::Malformed)
+    );
+}
+
+#[test]
 fn a_request_without_a_body_reads_its_method_and_target() {
     assert_eq!(
         read(b"GET /eSCL/ScannerStatus HTTP/1.1\r\nHost: scanner\r\nConnection: close\r\n\r\n"),

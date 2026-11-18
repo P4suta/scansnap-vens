@@ -77,8 +77,10 @@ pub enum Request {
 pub enum Input<R, P> {
     Request { request: Request, responder: R },
     Reserved,
+    Abandoned,
     Refused(Refusal),
     Page { side: Side, page: P },
+    PageWritten { id: Uuid, returned: Option<P> },
     Finished(Ending),
 }
 
@@ -120,6 +122,11 @@ pub enum Effect<R, P> {
         responder: R,
         response: Response<P>,
     },
+    Transfer {
+        responder: R,
+        id: Uuid,
+        page: P,
+    },
     /// Starts the job thread, which reports the reserve, each page, and the end.
     Start(JobSettings),
 }
@@ -141,6 +148,14 @@ impl<R, P> Effects<R, P> {
         Self::one(Effect::Reply {
             responder,
             response,
+        })
+    }
+
+    const fn transfer(responder: R, id: Uuid, page: P) -> Self {
+        Self::one(Effect::Transfer {
+            responder,
+            id,
+            page,
         })
     }
 }
@@ -221,14 +236,49 @@ enum Phase<R> {
 }
 
 #[derive(Debug, Clone)]
+enum Transfer<P> {
+    Idle,
+    Writing,
+    Retry(P),
+}
+
+#[derive(Debug, Clone)]
 struct Job<R, P, const N: usize> {
     id: Uuid,
     sides: Sides,
     phase: Phase<R>,
     pages: Queue<P, N>,
+    transfer: Transfer<P>,
     delivered: u32,
     lost: u32,
+    fault_observed: bool,
     touched: Moment,
+}
+
+impl<R, P, const N: usize> Job<R, P, N> {
+    const fn has_pages(&self) -> bool {
+        !self.pages.is_empty() || !matches!(self.transfer, Transfer::Idle)
+    }
+
+    fn pending(&self) -> u32 {
+        let assigned = u32::from(!matches!(self.transfer, Transfer::Idle));
+        self.pages.count().saturating_add(assigned)
+    }
+
+    fn take_page(&mut self) -> Option<P> {
+        let page = match mem::replace(&mut self.transfer, Transfer::Idle) {
+            Transfer::Retry(page) => Some(page),
+            Transfer::Idle => self.pages.pop(),
+            Transfer::Writing => {
+                self.transfer = Transfer::Writing;
+                None
+            }
+        };
+        if page.is_some() {
+            self.transfer = Transfer::Writing;
+        }
+        page
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -316,8 +366,12 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
         match input {
             Input::Request { request, responder } => bridge.request(request, responder, now),
             Input::Reserved => bridge.reserved(),
+            Input::Abandoned => bridge.abandoned(),
             Input::Refused(refusal) => bridge.refused(refusal, now),
             Input::Page { side, page } => bridge.page(side, page),
+            Input::PageWritten { id, returned } => {
+                (bridge.page_written(id, returned, now), Effects::none())
+            }
             Input::Finished(ending) => bridge.finished(ending, now),
         }
     }
@@ -327,8 +381,13 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Activity::Idle(Some(hint)) => now >= hint.until,
             Activity::Idle(None) => false,
             Activity::Busy(job) => match job.phase {
+                Phase::Finished(Ending::Failed(_)) if !job.has_pages() && !job.fault_observed => {
+                    false
+                }
                 Phase::Finished(_) => {
-                    let stay = if job.pages.is_empty() {
+                    let stay = if matches!(job.transfer, Transfer::Writing) {
+                        return self;
+                    } else if !job.has_pages() {
                         HINT_MILLIS
                     } else {
                         RETENTION_MILLIS
@@ -378,7 +437,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Some(JobInfo {
                 id: job.id,
                 images_completed: job.delivered,
-                images_to_transfer: job.pages.count(),
+                images_to_transfer: job.pending(),
                 state,
             })
         };
@@ -394,7 +453,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                 AdfState::Loaded,
                 info(JobState::Canceled),
             ),
-            Phase::Finished(_) if !job.pages.is_empty() => (
+            Phase::Finished(_) if job.has_pages() => (
                 ScannerState::Processing,
                 AdfState::Loaded,
                 info(JobState::Processing),
@@ -418,7 +477,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Activity::Idle(_) => false,
             Activity::Busy(job) => match job.phase {
                 Phase::Starting(_) | Phase::Scanning { .. } | Phase::Canceled => true,
-                Phase::Finished(_) => !job.pages.is_empty(),
+                Phase::Finished(_) => job.has_pages(),
             },
         };
         if busy {
@@ -433,8 +492,10 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             sides: settings.sides(),
             phase: Phase::Starting(responder),
             pages: Queue::new(),
+            transfer: Transfer::Idle,
             delivered: 0,
             lost: 0,
+            fault_observed: false,
             touched: now,
         });
         self.jobs = jobs;
@@ -490,6 +551,22 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
         (self, effects)
     }
 
+    fn abandoned(mut self) -> (Self, Effects<R, P>) {
+        let effects = self
+            .take_job()
+            .map_or_else(Effects::none, |job| match job.phase {
+                Phase::Starting(_) | Phase::Canceled => Effects::none(),
+                Phase::Scanning { waiter } => waiter.map_or_else(Effects::none, |waiter| {
+                    Effects::reply(waiter, Response::NotFound)
+                }),
+                phase @ Phase::Finished(_) => {
+                    self.keep(Job { phase, ..job });
+                    Effects::none()
+                }
+            });
+        (self, effects)
+    }
+
     fn page(mut self, side: Side, page: P) -> (Self, Effects<R, P>) {
         let Some(mut job) = self.take_job() else {
             return (self, Effects::none());
@@ -499,12 +576,13 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Phase::Scanning {
                 waiter: Some(responder),
             } if wanted => {
-                job.delivered = job.delivered.saturating_add(1);
+                let id = job.id;
                 self.keep(Job {
                     phase: Phase::Scanning { waiter: None },
+                    transfer: Transfer::Writing,
                     ..job
                 });
-                Effects::reply(responder, Response::Page(page))
+                Effects::transfer(responder, id, page)
             }
             Phase::Scanning { waiter: None } if wanted => {
                 if job.pages.push(page).is_err() {
@@ -527,6 +605,22 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
         (self, effects)
     }
 
+    fn page_written(mut self, id: Uuid, returned: Option<P>, now: Moment) -> Self {
+        if let Activity::Busy(job) = &mut self.activity
+            && job.id == id
+            && matches!(job.transfer, Transfer::Writing)
+        {
+            job.transfer = if let Some(page) = returned {
+                Transfer::Retry(page)
+            } else {
+                job.delivered = job.delivered.saturating_add(1);
+                Transfer::Idle
+            };
+            job.touched = now;
+        }
+        self
+    }
+
     fn finished(mut self, ending: Ending, now: Moment) -> (Self, Effects<R, P>) {
         let Some(job) = self.take_job() else {
             return (self, Effects::none());
@@ -539,6 +633,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                 };
                 self.keep(Job {
                     phase: Phase::Finished(ending),
+                    fault_observed: waiter.is_some(),
                     touched: now,
                     ..job
                 });
@@ -567,16 +662,31 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             self.keep(job);
             return (self, Effects::reply(responder, Response::NotFound));
         }
+        let page = match job.phase {
+            Phase::Scanning { .. } | Phase::Finished(_) => {
+                if matches!(job.transfer, Transfer::Writing) {
+                    self.keep(job);
+                    return (
+                        self,
+                        Effects::reply(
+                            responder,
+                            Response::Unavailable(Unavailable::JobInProgress),
+                        ),
+                    );
+                }
+                job.take_page()
+            }
+            Phase::Starting(_) | Phase::Canceled => None,
+        };
         let effects = match job.phase {
             Phase::Scanning { waiter } => {
                 job.touched = now;
-                if let Some(page) = job.pages.pop() {
-                    job.delivered = job.delivered.saturating_add(1);
+                if let Some(page) = page {
                     self.keep(Job {
                         phase: Phase::Scanning { waiter },
                         ..job
                     });
-                    Effects::reply(responder, Response::Page(page))
+                    Effects::transfer(responder, id, page)
                 } else {
                     self.keep(Job {
                         phase: Phase::Scanning {
@@ -591,18 +701,16 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             }
             Phase::Finished(ending) => {
                 job.touched = now;
-                let response = job.pages.pop().map_or_else(
-                    || end_of(ending),
-                    |page| {
-                        job.delivered = job.delivered.saturating_add(1);
-                        Response::Page(page)
-                    },
-                );
+                job.fault_observed |= page.is_none();
+                let effects = match page {
+                    Some(page) => Effects::transfer(responder, id, page),
+                    None => Effects::reply(responder, end_of(ending)),
+                };
                 self.keep(Job {
                     phase: Phase::Finished(ending),
                     ..job
                 });
-                Effects::reply(responder, response)
+                effects
             }
             phase @ (Phase::Starting(_) | Phase::Canceled) => {
                 self.keep(Job { phase, ..job });
@@ -625,6 +733,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                 self.keep(Job {
                     phase: Phase::Canceled,
                     pages: Queue::new(),
+                    transfer: Transfer::Idle,
                     ..job
                 });
                 let deleted = Effect::Reply {

@@ -39,6 +39,7 @@ impl Report for Reports {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seen {
     Reserved,
+    Abandoned,
     Refused(Refusal),
     Page(Side, bool),
     Finished(Ending, bool),
@@ -85,6 +86,7 @@ fn seen(events: Vec<Event>) -> Option<Vec<Seen>> {
             .into_iter()
             .map(|event| match event {
                 JobEvent::Reserved => Seen::Reserved,
+                JobEvent::Abandoned { .. } => Seen::Abandoned,
                 JobEvent::Refused { refusal, .. } => Seen::Refused(refusal),
                 JobEvent::Page { side, page } => Seen::Page(side, frame_size(&page).is_ok()),
                 JobEvent::Finished { ending, detail } => Seen::Finished(ending, detail.is_some()),
@@ -112,6 +114,46 @@ fn a_recorded_stack_reports_the_reserve_each_page_and_the_end() {
         seen(events(THREE_SHEETS)),
         Some(scanned(3, Seen::Finished(Ending::Completed, false)))
     );
+}
+
+#[test]
+fn a_client_that_departs_before_reserve_or_declines_creation_gets_no_pages() {
+    struct Closed {
+        waiting: bool,
+        reserved: bool,
+        reports: Vec<JobEvent>,
+    }
+
+    impl Report for Closed {
+        fn report(&mut self, event: JobEvent) {
+            self.reports.push(event);
+        }
+
+        fn client_waiting(&self) -> bool {
+            self.waiting
+        }
+
+        fn created(&mut self) -> bool {
+            self.reserved = true;
+            false
+        }
+    }
+
+    let outcome = |waiting| {
+        let mut network = FixtureNetwork::new(events(ONE_SHEET))?;
+        let mut report = Closed {
+            waiting,
+            reserved: false,
+            reports: Vec::new(),
+        };
+        run_job(&mut network, Ipv4Addr::BROADCAST, &mut report);
+        Some((
+            report.reserved,
+            matches!(report.reports.as_slice(), [JobEvent::Abandoned { .. }]),
+        ))
+    };
+    assert_eq!(outcome(false), Some((false, true)));
+    assert_eq!(outcome(true), Some((true, true)));
 }
 
 #[test]
@@ -170,7 +212,7 @@ fn heights_and_detail(events: Vec<Event>) -> Option<(Vec<Option<u16>>, Option<St
                 heights.push(frame_size(&page).ok().map(|frame| frame.height));
             }
             JobEvent::Finished { detail, .. } => ending = detail,
-            JobEvent::Reserved | JobEvent::Refused { .. } => {}
+            JobEvent::Reserved | JobEvent::Refused { .. } | JobEvent::Abandoned { .. } => {}
         }
     }
     Some((heights, ending))

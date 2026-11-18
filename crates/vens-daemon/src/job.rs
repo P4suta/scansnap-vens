@@ -12,7 +12,7 @@ use vens_escl::bridge::{Ending, Fault, Refusal, Side};
 use vens_net::{
     control::ControlError,
     network::Network,
-    operation::{self, JobRun},
+    operation::{self, JobRun, ReservedScanner},
     scan::{PageSink, ScanError},
     session::{JobFailure, PrepareError},
 };
@@ -21,6 +21,9 @@ use vens_net::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobEvent {
     Reserved,
+    Abandoned {
+        detail: Option<String>,
+    },
     Refused {
         refusal: Refusal,
         detail: String,
@@ -38,6 +41,15 @@ pub enum JobEvent {
 /// Carries the events of the job thread to the owner.
 pub trait Report {
     fn report(&mut self, event: JobEvent);
+
+    fn client_waiting(&self) -> bool {
+        true
+    }
+
+    fn created(&mut self) -> bool {
+        self.report(JobEvent::Reserved);
+        true
+    }
 }
 
 struct Pages<'a, T> {
@@ -110,6 +122,9 @@ where
     N::Error: Debug,
     T: Report,
 {
+    if !report.client_waiting() {
+        return report.report(JobEvent::Abandoned { detail: None });
+    }
     let mut connected = match operation::open(network, target) {
         Ok(connected) => connected,
         Err(failure) => return refuse(report, Refusal::Unreachable, &failure),
@@ -131,6 +146,9 @@ where
             return refuse(report, Refusal::NoPaper, &paper);
         }
     }
+    if !report.client_waiting() {
+        return report.report(JobEvent::Abandoned { detail: None });
+    }
     let reserved = match connected.reserve(prepared) {
         Ok(reserved) => reserved,
         Err(ControlError::Reserve(ReserveRefusal::Occupied)) => {
@@ -138,7 +156,42 @@ where
         }
         Err(failure) => return refuse(report, Refusal::Unreachable, &failure),
     };
-    report.report(JobEvent::Reserved);
+    scan_reserved(reserved, report);
+}
+
+/// Runs an eSCL job on the scanner that the button worker holds.
+pub fn run_reserved<N, T>(mut scanner: ReservedScanner<N>, report: &mut T)
+where
+    N: Network,
+    N::Error: Debug,
+    T: Report,
+{
+    match scanner.prepare().map(|prepared| prepared.paper()) {
+        Ok(PaperPath::TopChute) => scan_reserved(scanner, report),
+        Ok(paper @ (PaperPath::FrontSlot | PaperPath::Absent)) => {
+            let release = scanner.release();
+            refuse(report, Refusal::NoPaper, &(paper, release));
+        }
+        Err(failure) => {
+            let release = scanner.release();
+            refuse(report, Refusal::Unreachable, &(failure, release));
+        }
+    }
+}
+
+fn scan_reserved<N, T>(reserved: ReservedScanner<N>, report: &mut T)
+where
+    N: Network,
+    N::Error: Debug,
+    T: Report,
+{
+    if !report.created() {
+        let detail = reserved
+            .release()
+            .err()
+            .map(|error| format!("release failed: {error:?}"));
+        return report.report(JobEvent::Abandoned { detail });
+    }
     let run = reserved.scan(&mut Pages {
         report: &mut *report,
         image: Vec::new(),

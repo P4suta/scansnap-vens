@@ -50,7 +50,34 @@ fn feed<const N: usize>(
         (bridge, Log::new()),
         |(bridge, mut log), (millis, input)| {
             let (bridge, effects) = bridge.handle(input, Moment::from_millis(millis));
-            log.push(effects.into_iter().collect());
+            let (bridge, replies) =
+                effects
+                    .into_iter()
+                    .fold(
+                        (bridge, Vec::new()),
+                        |(bridge, mut replies), effect| match effect {
+                            Effect::Transfer {
+                                responder,
+                                id,
+                                page,
+                            } => {
+                                let (bridge, _) = bridge.handle(
+                                    Input::PageWritten { id, returned: None },
+                                    Moment::from_millis(millis),
+                                );
+                                replies.push(Effect::Reply {
+                                    responder,
+                                    response: Response::Page(page),
+                                });
+                                (bridge, replies)
+                            }
+                            effect @ (Effect::Reply { .. } | Effect::Start(_)) => {
+                                replies.push(effect);
+                                (bridge, replies)
+                            }
+                        },
+                    );
+            log.push(replies);
             (bridge, log)
         },
     )
@@ -81,7 +108,7 @@ fn status_of<const N: usize>(
             response: Response::Status(status),
             ..
         } => Some(status),
-        Effect::Reply { .. } | Effect::Start(_) => None,
+        Effect::Reply { .. } | Effect::Start(_) | Effect::Transfer { .. } => None,
     })
 }
 
@@ -91,7 +118,7 @@ fn created(effects: Option<&Effects>) -> Option<Uuid> {
             response: Response::Created(path),
             ..
         } => Some(path.job()),
-        Effect::Reply { .. } | Effect::Start(_) => None,
+        Effect::Reply { .. } | Effect::Start(_) | Effect::Transfer { .. } => None,
     })
 }
 
@@ -551,6 +578,86 @@ fn a_failed_job_delivers_its_pages_and_then_a_conflict() {
                     adf: AdfState::Jam,
                     job: Some(info(id, 1, 0, JobState::Aborted)),
                 }),
+            ),
+        )
+    }));
+}
+
+#[test]
+fn a_drained_failure_waits_for_the_clients_next_page_request() {
+    let answer = started::<4>(duplex()).map(|(bridge, id)| {
+        let (_, log) = feed(
+            bridge,
+            [
+                (2, page(Side::Front, "front")),
+                (3, Input::Finished(Ending::Failed(Fault::Jam))),
+                (4, request(Request::NextDocument(id), "page")),
+                (
+                    RETENTION_MILLIS.saturating_mul(2),
+                    request(Request::NextDocument(id), "fault"),
+                ),
+            ],
+        );
+        log.into_iter().last()
+    });
+    assert_eq!(
+        answer.flatten(),
+        Some(reply(
+            "fault",
+            Response::Conflict(Conflict::Failed(Fault::Jam))
+        ))
+    );
+}
+
+#[test]
+fn a_failed_write_keeps_the_same_page_at_the_front_of_the_job() {
+    check(started::<4>(duplex()).map(|(bridge, id)| {
+        let (bridge, _) = feed(
+            bridge,
+            [
+                (2, page(Side::Front, "front")),
+                (3, page(Side::Back, "back")),
+                (4, Input::Finished(Ending::Completed)),
+            ],
+        );
+        let (bridge, first) = bridge.handle(
+            request(Request::NextDocument(id), "first"),
+            Moment::from_millis(5),
+        );
+        let sent = |responder| Effect::Transfer {
+            responder,
+            id,
+            page: "front",
+        };
+        let before = status_of(&bridge, 6).and_then(|status| status.job);
+        let (bridge, _) = bridge.handle(
+            Input::PageWritten {
+                id,
+                returned: Some("front"),
+            },
+            Moment::from_millis(7),
+        );
+        let (bridge, retry) = bridge.handle(
+            request(Request::NextDocument(id), "retry"),
+            Moment::from_millis(8),
+        );
+        let (bridge, _) = bridge.handle(
+            Input::PageWritten { id, returned: None },
+            Moment::from_millis(9),
+        );
+        let after = status_of(&bridge, 10).and_then(|status| status.job);
+        (
+            (
+                first.into_iter().next(),
+                retry.into_iter().next(),
+                before,
+                after,
+            ),
+            (
+                Some(sent("first")),
+                Some(sent("retry")),
+                Some(info(id, 0, 2, JobState::Processing)),
+                Some(info(id, 1, 1, JobState::Processing)),
             ),
         )
     }));

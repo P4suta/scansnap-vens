@@ -1,6 +1,6 @@
 ---
 date: 2026-11-16
-status: proposed
+status: accepted
 ---
 
 # Reuse the registered host identifier
@@ -32,5 +32,5 @@ Reconsider this choice if a firmware update stops returning the identifier witho
 
 ## Confirmation
 
-A hardware run reads the identifier, reserves, scans, and releases.
-A second run succeeds after the vendor software has connected between the two runs.
+The first hardware run used the registered identifier to scan a sheet.
+On 2026-11-18 a duplex scan succeeded after ScanSnap Home on Windows released the reservation.

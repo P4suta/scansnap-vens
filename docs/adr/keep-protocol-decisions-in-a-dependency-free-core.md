@@ -1,6 +1,6 @@
 ---
 date: 2026-11-16
-status: proposed
+status: accepted
 ---
 
 # Keep protocol decisions in a dependency-free core
@@ -33,4 +33,4 @@ Reconsider the allocation ban if a required frame can't fit a caller-provided bu
 ## Confirmation
 
 `mise x -- just check` compiles the core without the standard library and runs the static type lint.
-The record stays proposed until the first hardware scan completes through the core.
+On 2026-11-16 the first hardware scan completed through the core and produced both sides of one sheet.

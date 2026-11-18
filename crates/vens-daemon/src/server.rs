@@ -2,7 +2,8 @@ use std::{
     fmt::Debug,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    sync::mpsc::{self, Receiver, Sender},
+    path::PathBuf,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread::{self, Scope},
     time::{Duration, Instant},
 };
@@ -12,16 +13,18 @@ use vens_escl::{
     bridge::{Bridge, Effect, Input, Moment, Refusal, Request, Response, Side},
     uuid::Uuid,
 };
-use vens_net::network::Network;
+use vens_net::{host::SystemNetwork, network::Network};
 
 use crate::{
+    button,
     http::{Limits, read_request, refusal, refusal_status, status, write_refusal, write_response},
     job::{JobEvent, Report, run_job},
     request::escl_request,
 };
 
-/// The connections that the daemon reads at the same time, so a waiting request leaves room for others.
-const ACCEPTORS: usize = 4;
+const CONNECTIONS_PER_LISTENER: usize = 32;
+const PEER_CHECK: Duration = Duration::from_millis(10);
+const PEER_POLL: Duration = Duration::from_millis(100);
 /// The pages that a job keeps for its client, both sides of 128 sheets.
 const QUEUE: usize = 256;
 /// The pause after a failed accept, so a lasting failure doesn't spin.
@@ -39,6 +42,11 @@ pub struct Config {
     /// The time that a whole request may take to arrive.
     pub request_timeout: Duration,
     pub write_timeout: Duration,
+}
+
+pub struct Capture {
+    pub folder: PathBuf,
+    pub network: SystemNetwork,
 }
 
 /// Supplies the network that each job uses.
@@ -62,7 +70,48 @@ struct JobRequest {
 struct Responder {
     line: String,
     job: Option<JobRequest>,
-    reply: Sender<Response<Vec<u8>>>,
+    reply: Sender<Reply>,
+    starter: Option<TcpStream>,
+}
+
+enum Acknowledge {
+    None,
+    Created(Sender<bool>),
+    Page { id: Uuid, events: Sender<Event> },
+}
+
+struct Reply {
+    response: Response<Vec<u8>>,
+    acknowledge: Acknowledge,
+}
+
+impl Reply {
+    fn written(&mut self, success: bool) {
+        match std::mem::replace(&mut self.acknowledge, Acknowledge::None) {
+            Acknowledge::Created(decision) => {
+                let _ = decision.send(success);
+            }
+            Acknowledge::Page { id, events } => {
+                let returned = if success {
+                    None
+                } else if let Response::Page(page) =
+                    std::mem::replace(&mut self.response, Response::NotFound)
+                {
+                    Some(page)
+                } else {
+                    None
+                };
+                let _ = events.send(Event::Transfer { id, returned });
+            }
+            Acknowledge::None => {}
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        self.written(false);
+    }
 }
 
 enum Event {
@@ -71,14 +120,35 @@ enum Event {
         responder: Responder,
     },
     Job(JobEvent),
+    Creation(Sender<bool>),
+    Transfer {
+        id: Uuid,
+        returned: Option<Vec<u8>>,
+    },
     Line(String),
 }
 
-struct ToOwner(Sender<Event>);
+struct ToOwner {
+    events: Sender<Event>,
+    peer: Option<TcpStream>,
+    timeout: Duration,
+}
 
 impl Report for ToOwner {
     fn report(&mut self, event: JobEvent) {
-        let _ = self.0.send(Event::Job(event));
+        let _ = self.events.send(Event::Job(event));
+    }
+
+    fn client_waiting(&self) -> bool {
+        self.peer.as_ref().is_none_or(peer_waiting)
+    }
+
+    fn created(&mut self) -> bool {
+        let (decision, observed) = mpsc::channel();
+        let delivered = self.events.send(Event::Creation(decision)).is_ok()
+            && observed.recv_timeout(self.timeout) == Ok(true);
+        self.peer = None;
+        delivered
     }
 }
 
@@ -93,19 +163,34 @@ struct Deadline<'a> {
     limit: Duration,
 }
 
-impl Read for Deadline<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+impl<'a> Deadline<'a> {
+    fn new(stream: &'a mut TcpStream, limit: Duration) -> Self {
+        Self {
+            stream,
+            started: Instant::now(),
+            limit,
+        }
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
         let remaining = self.limit.saturating_sub(self.started.elapsed());
         if remaining.is_zero() {
             return Err(io::Error::from(io::ErrorKind::TimedOut));
         }
-        self.stream.set_read_timeout(Some(remaining))?;
+        Ok(remaining)
+    }
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
         self.stream.read(buffer)
     }
 }
 
 impl Write for Deadline<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
         self.stream.write(bytes)
     }
 
@@ -114,24 +199,47 @@ impl Write for Deadline<'_> {
     }
 }
 
-fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Sender<Event>) {
-    if let Err(error) = stream.set_write_timeout(Some(config.write_timeout)) {
-        return line(events, format!("{peer} timeouts failed: {error}"));
+fn peer_waiting(stream: &TcpStream) -> bool {
+    match stream.peek(&mut [0_u8; 1]) {
+        Ok(read) => read != 0,
+        Err(error) => matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        ),
     }
-    let mut deadline = Deadline {
-        stream: &mut stream,
-        started: Instant::now(),
-        limit: config.request_timeout,
-    };
-    let request = match read_request(&mut deadline, config.limits) {
+}
+
+fn await_reply(answers: &Receiver<Reply>, stream: &TcpStream, timeout: Duration) -> Option<Reply> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return None;
+        }
+        match answers.recv_timeout(remaining.min(PEER_POLL)) {
+            Ok(reply) => return Some(reply),
+            Err(RecvTimeoutError::Timeout) if peer_waiting(stream) => {}
+            Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => return None,
+        }
+    }
+}
+
+fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Sender<Event>) {
+    let request = match read_request(
+        &mut Deadline::new(&mut stream, config.request_timeout),
+        config.limits,
+    ) {
         Ok(request) => request,
         Err(error) => {
             let text = match refusal(error) {
                 Some(refusal) => {
                     let (code, _) = refusal_status(refusal);
-                    let written = write_refusal(&mut stream, refusal)
-                        .err()
-                        .map_or_else(String::new, |failure| format!(", write failed: {failure}"));
+                    let written = write_refusal(
+                        &mut Deadline::new(&mut stream, config.write_timeout),
+                        refusal,
+                    )
+                    .err()
+                    .map_or_else(String::new, |failure| format!(", write failed: {failure}"));
                     format!("{peer} unreadable request {error:?} {code}{written}")
                 }
                 None => format!("{peer} request ended: {error:?}"),
@@ -139,8 +247,24 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
             return line(events, text);
         }
     };
+    if let Err(error) = stream.set_read_timeout(Some(PEER_CHECK)) {
+        return line(events, format!("{peer} timeouts failed: {error}"));
+    }
     let (reply, answers) = mpsc::channel();
     let escl = escl_request(&request);
+    let starter = if matches!(escl, Request::CreateJob(Ok(_))) {
+        match stream.try_clone() {
+            Ok(pending) => Some(pending),
+            Err(error) => {
+                return line(
+                    events,
+                    format!("{peer} couldn't track the job request: {error}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let job = matches!(escl, Request::CreateJob(_) | Request::Malformed).then(|| JobRequest {
         client: format!(
             "client {:?}, type {:?}",
@@ -160,6 +284,7 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
         ),
         job,
         reply,
+        starter,
     };
     if events
         .send(Event::Request {
@@ -170,18 +295,59 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
     {
         return;
     }
-    let Ok(response) = answers.recv() else {
+    let Some(mut reply) = await_reply(&answers, &stream, config.write_timeout) else {
         return;
     };
-    if let Err(error) = write_response(&mut stream, &response) {
+    let written = if matches!(reply.acknowledge, Acknowledge::None) || peer_waiting(&stream) {
+        write_response(
+            &mut Deadline::new(&mut stream, config.write_timeout),
+            &reply.response,
+        )
+    } else {
+        Err(io::Error::from(io::ErrorKind::BrokenPipe))
+    };
+    if let Err(error) = &written {
         line(events, format!("{peer} write failed: {error}"));
+    }
+    reply.written(written.is_ok());
+}
+
+struct ConnectionSlot(Sender<()>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
     }
 }
 
-fn accept(listener: &TcpListener, config: Config, events: &Sender<Event>) {
+fn accept<'scope>(
+    scope: &'scope Scope<'scope, '_>,
+    listener: &TcpListener,
+    config: Config,
+    events: &Sender<Event>,
+) {
+    let (completion, completed) = mpsc::channel();
+    let mut active = 0_usize;
     loop {
         match listener.accept() {
-            Ok((stream, peer)) => answer(stream, peer, config, events),
+            Ok((stream, peer)) => {
+                active = active.saturating_sub(completed.try_iter().count());
+                if active >= CONNECTIONS_PER_LISTENER {
+                    continue;
+                }
+                let messages = events.clone();
+                let completion = completion.clone();
+                let spawned = thread::Builder::new()
+                    .name("vensd request".to_owned())
+                    .spawn_scoped(scope, move || {
+                        let _slot = ConnectionSlot(completion);
+                        answer(stream, peer, config, &messages);
+                    });
+                match spawned {
+                    Ok(_) => active = active.saturating_add(1),
+                    Err(error) => line(events, format!("a request thread couldn't start: {error}")),
+                }
+            }
             Err(error) => {
                 line(events, format!("accept failed: {error}"));
                 thread::sleep(ACCEPT_BACKOFF);
@@ -198,24 +364,23 @@ fn start_job<'scope, S: Networks>(
     scope: &'scope Scope<'scope, '_>,
     networks: &mut S,
     target: Ipv4Addr,
-    events: &Sender<Event>,
+    mut report: ToOwner,
 ) {
-    let mut fallback = ToOwner(events.clone());
     let Some(mut network) = networks.network() else {
-        return fallback.report(JobEvent::Refused {
+        return report.report(JobEvent::Refused {
             refusal: Refusal::Unreachable,
             detail: "no network for the job".to_owned(),
         });
     };
-    let mut report = ToOwner(events.clone());
+    let events = report.events.clone();
     let spawned = thread::Builder::new()
         .name("vensd job".to_owned())
         .spawn_scoped(scope, move || run_job(&mut network, target, &mut report));
     if let Err(error) = spawned {
-        fallback.report(JobEvent::Refused {
+        let _ = events.send(Event::Job(JobEvent::Refused {
             refusal: Refusal::Unreachable,
             detail: format!("the job thread couldn't start: {error}"),
-        });
+        }));
     }
 }
 
@@ -246,31 +411,61 @@ fn reason<P>(response: &Response<P>) -> String {
     }
 }
 
-fn input<L: Log>(event: Event, log: &mut L) -> Option<Input<Responder, Vec<u8>>> {
-    match event {
-        Event::Request { request, responder } => Some(Input::Request { request, responder }),
+type OwnerInput = Input<Responder, Vec<u8>>;
+
+fn input<L: Log>(event: Event, log: &mut L) -> Option<(OwnerInput, Option<Sender<bool>>)> {
+    let input = match event {
+        Event::Request { request, responder } => Input::Request { request, responder },
+        Event::Creation(decision) => {
+            log.record("job reserved the scanner");
+            return Some((Input::Reserved, Some(decision)));
+        }
         Event::Job(JobEvent::Reserved) => {
             log.record("job reserved the scanner");
-            Some(Input::Reserved)
+            Input::Reserved
+        }
+        Event::Job(JobEvent::Abandoned { detail }) => {
+            let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
+            log.record(&format!("job client left before the scan{detail}"));
+            Input::Abandoned
         }
         Event::Job(JobEvent::Refused { refusal, detail }) => {
             log.record(&format!("job refused: {refusal:?} ({detail})"));
-            Some(Input::Refused(refusal))
+            Input::Refused(refusal)
         }
         Event::Job(JobEvent::Page { side, page }) => {
             log.record(&page_line(side, &page));
-            Some(Input::Page { side, page })
+            Input::Page { side, page }
         }
+        Event::Transfer { id, returned } => Input::PageWritten { id, returned },
         Event::Job(JobEvent::Finished { ending, detail }) => {
             let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
             log.record(&format!("job finished: {ending:?}{detail}"));
-            Some(Input::Finished(ending))
+            Input::Finished(ending)
         }
         Event::Line(text) => {
             log.record(&text);
-            None
+            return None;
         }
+    };
+    Some((input, None))
+}
+
+fn respond<L: Log>(responder: &Responder, reply: Reply, log: &mut L) {
+    let (code, _) = status(&reply.response);
+    let client = responder
+        .job
+        .as_ref()
+        .map_or_else(String::new, |job| format!(" {}", job.client));
+    log.record(&format!(
+        "{} {code}{}{client}",
+        responder.line,
+        reason(&reply.response)
+    ));
+    if let (400..=599, Some(job)) = (code, &responder.job) {
+        log.record(&format!("{} body {:?}", responder.line, job.body));
     }
+    let _ = responder.reply.send(reply);
 }
 
 fn own<'scope, S: Networks, L: Log>(
@@ -278,14 +473,20 @@ fn own<'scope, S: Networks, L: Log>(
     inbox: &Receiver<Event>,
     events: &Sender<Event>,
     networks: &mut S,
+    worker: Option<&Sender<ToOwner>>,
     config: Config,
     log: &mut L,
 ) {
     let started = Instant::now();
     let mut bridge = Bridge::<Responder, Vec<u8>, QUEUE>::new(config.uuid, config.seed);
     while let Ok(event) = inbox.recv() {
-        let Some(input) = input(event, log) else {
+        let Some((mut input, mut created)) = input(event, log) else {
             continue;
+        };
+        let mut peer = if let Input::Request { responder, .. } = &mut input {
+            responder.starter.take()
+        } else {
+            None
         };
         let (next, effects) = bridge.handle(input, now(started));
         bridge = next;
@@ -295,22 +496,56 @@ fn own<'scope, S: Networks, L: Log>(
                     responder,
                     response,
                 } => {
-                    let (code, _) = status(&response);
-                    let client = responder
-                        .job
-                        .as_ref()
-                        .map_or_else(String::new, |job| format!(" {}", job.client));
-                    log.record(&format!(
-                        "{} {code}{}{client}",
-                        responder.line,
-                        reason(&response)
-                    ));
-                    if let (400..=599, Some(job)) = (code, &responder.job) {
-                        log.record(&format!("{} body {:?}", responder.line, job.body));
-                    }
-                    let _ = responder.reply.send(response);
+                    let acknowledge = created
+                        .take()
+                        .map_or(Acknowledge::None, Acknowledge::Created);
+                    respond(
+                        &responder,
+                        Reply {
+                            response,
+                            acknowledge,
+                        },
+                        log,
+                    );
                 }
-                Effect::Start(_) => start_job(scope, networks, config.target, events),
+                Effect::Transfer {
+                    responder,
+                    id,
+                    page,
+                } => {
+                    respond(
+                        &responder,
+                        Reply {
+                            response: Response::Page(page),
+                            acknowledge: Acknowledge::Page {
+                                id,
+                                events: events.clone(),
+                            },
+                        },
+                        log,
+                    );
+                }
+                Effect::Start(_) => {
+                    let Some(peer) = peer.take() else {
+                        let _ = events.send(Event::Job(JobEvent::Abandoned { detail: None }));
+                        continue;
+                    };
+                    let report = ToOwner {
+                        events: events.clone(),
+                        peer: Some(peer),
+                        timeout: config.write_timeout,
+                    };
+                    if let Some(worker) = worker {
+                        if let Err(mut dropped) = worker.send(report) {
+                            dropped.0.report(JobEvent::Refused {
+                                refusal: Refusal::Unreachable,
+                                detail: "the button worker stopped".to_owned(),
+                            });
+                        }
+                    } else {
+                        start_job(scope, networks, config.target, report);
+                    }
+                }
             }
         }
     }
@@ -319,25 +554,63 @@ fn own<'scope, S: Networks, L: Log>(
 /// Serves eSCL clients on the listener and runs each job on a network from `networks`.
 ///
 /// One thread owns the bridge state, and the others only send it events: each accepted request, and each step of the running job.
-pub fn serve<S: Networks, L: Log>(
+pub fn serve<S: Networks, L: Log>(listeners: &[TcpListener], networks: S, config: Config, log: L) {
+    serve_configured(listeners, networks, config, log, None);
+}
+
+/// Serves eSCL and optionally starts a single worker for HTTP jobs and the Scan button.
+pub fn serve_configured<S: Networks, L: Log>(
     listeners: &[TcpListener],
     mut networks: S,
     config: Config,
     mut log: L,
+    capture: Option<Capture>,
 ) {
     let (events, inbox) = mpsc::channel();
     thread::scope(|scope| {
+        let worker = if let Some(capture) = capture {
+            let (jobs, work) = mpsc::channel();
+            let messages = events.clone();
+            let started = thread::Builder::new()
+                .name("vensd scanner".to_owned())
+                .spawn_scoped(scope, move || {
+                    button::run(
+                        capture.network,
+                        config.target,
+                        &capture.folder,
+                        &work,
+                        |text| {
+                            line(&messages, text.to_owned());
+                        },
+                    );
+                });
+            if let Err(error) = started {
+                log.record(&format!("the scanner worker couldn't start: {error}"));
+                return;
+            }
+            Some(jobs)
+        } else {
+            None
+        };
         for listener in listeners {
-            for _ in 0..ACCEPTORS {
-                let acceptor_events = events.clone();
-                let spawned = thread::Builder::new()
-                    .name("vensd acceptor".to_owned())
-                    .spawn_scoped(scope, move || accept(listener, config, &acceptor_events));
-                if let Err(error) = spawned {
-                    line(&events, format!("an acceptor couldn't start: {error}"));
-                }
+            let acceptor_events = events.clone();
+            let spawned = thread::Builder::new()
+                .name("vensd acceptor".to_owned())
+                .spawn_scoped(scope, move || {
+                    accept(scope, listener, config, &acceptor_events);
+                });
+            if let Err(error) = spawned {
+                line(&events, format!("an acceptor couldn't start: {error}"));
             }
         }
-        own(scope, &inbox, &events, &mut networks, config, &mut log);
+        own(
+            scope,
+            &inbox,
+            &events,
+            &mut networks,
+            worker.as_ref(),
+            config,
+            &mut log,
+        );
     });
 }

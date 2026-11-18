@@ -266,6 +266,7 @@ impl Network for SystemNetwork {
 
     fn open_trigger(&mut self, local: Ipv4Address) -> io::Result<(UdpSocket, Port)> {
         let socket = UdpSocket::bind((Ipv4Addr::from(local.octets()), ANY_PORT))?;
+        socket.set_nonblocking(true)?;
         match socket.local_addr()? {
             SocketAddr::V4(address) => {
                 let port = Port::new(address.port());

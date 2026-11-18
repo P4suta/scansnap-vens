@@ -1,6 +1,6 @@
 ---
 date: 2026-11-16
-status: proposed
+status: accepted
 ---
 
 # Verify with an emulator and explicit hardware runs
@@ -33,4 +33,4 @@ Reconsider this split when a second scanner model joins.
 ## Confirmation
 
 `mise x -- just check` passes on a machine without the scanner.
-The record stays proposed until the emulator replays the first redacted hardware trace.
+On 2026-11-16 the emulator replayed a redacted duplex hardware trace and produced both images at the recorded height.

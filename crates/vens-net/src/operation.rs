@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
-    net::{Ipv4Addr, SocketAddrV4},
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
     num::NonZeroU8,
 };
 
@@ -8,14 +9,17 @@ use vens_core::{
     Ipv4Address, MacAddress,
     command::ScsiStatus,
     discovery::{Probe, SearchReply},
+    keepalive::Elapsed,
     scan::Command,
     status::{HardwareStatus, StatusError},
+    trigger::{ButtonEvent, PACKET_LENGTH, RecentPresses},
 };
 
 use crate::{
     channel::{ChannelError, CommandChannel},
     control::{ControlChannel, ControlError},
-    keepalive::DatagramKeepalive,
+    host::SystemNetwork,
+    keepalive::{DatagramKeepalive, Keepalive},
     network::{Connection, Network},
     scan::{Clock, PageSink},
     search::{SearchError, search},
@@ -31,6 +35,8 @@ const DISCOVERY_PORT: u16 = 52217;
 const SEARCH_ATTEMPTS: NonZeroU8 = NonZeroU8::MIN.saturating_add(19);
 const STATUS_CAPACITY: usize = 64;
 const REPLY_CAPACITY: usize = 0x0030_0040;
+const RESERVE_TIMEOUT_MILLIS: u64 = 30_000;
+const TRIGGERS_PER_POLL: u8 = 16;
 
 /// Why the scanner couldn't be found or its connections couldn't open.
 #[derive(Debug, PartialEq, Eq)]
@@ -191,12 +197,12 @@ pub fn status<N: Network>(
 /// A scanner found on the network with both connections open and no reserve.
 pub struct Connected<N: Network> {
     host: Host,
+    scanner: Ipv4Addr,
     command: CommandChannel<N::Stream>,
     control: ControlChannel<N::Stream>,
     clock: N::Clock,
     keepalive: DatagramKeepalive<N::Keepalive>,
-    /// Keeps the port for button events bound while the scanner may send them.
-    _trigger: N::Trigger,
+    trigger: N::Trigger,
 }
 
 /// Finds the scanner at `target`, which may be the broadcast address, and opens its connections without a reserve.
@@ -228,6 +234,7 @@ pub fn open<N: Network>(
         clock.now(),
     );
     Ok(Connected {
+        scanner: Ipv4Addr::from(found.reply.address().octets()),
         host: Host {
             mac: HOST_MAC,
             address: found.local,
@@ -238,7 +245,7 @@ pub fn open<N: Network>(
         control,
         clock,
         keepalive,
-        _trigger: trigger,
+        trigger,
     })
 }
 
@@ -263,6 +270,7 @@ impl<N: Network> Connected<N> {
     ) -> Result<ReservedScanner<N>, ControlError<N::Error>> {
         let reserved = reserve(&mut self.control, self.host, prepared)?;
         Ok(ReservedScanner {
+            last_answer: self.clock.now(),
             connected: self,
             reserved,
         })
@@ -274,9 +282,28 @@ impl<N: Network> Connected<N> {
 pub struct ReservedScanner<N: Network> {
     connected: Connected<N>,
     reserved: Reserved,
+    last_answer: Elapsed,
 }
 
 impl<N: Network> ReservedScanner<N> {
+    /// Reads the paper position after the scanner has spent time waiting.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the status request fails or the scanner reports no registered host.
+    pub fn prepare(&mut self) -> Result<Prepared, PrepareError<N::Error>> {
+        self.connected.prepare()
+    }
+
+    /// Releases the scanner without starting a job.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the control channel or the release fails.
+    pub fn release(mut self) -> Result<(), ControlError<N::Error>> {
+        self.reserved.release(&mut self.connected.control)
+    }
+
     /// Scans the stack in the top chute into the sink, keeps the reserve alive meanwhile, and releases the scanner after the job.
     ///
     /// The run carries the outcome and any failure of the keepalive port, which never stops the job.
@@ -284,6 +311,7 @@ impl<N: Network> ReservedScanner<N> {
         let Self {
             mut connected,
             reserved,
+            ..
         } = self;
         let mut buffer = vec![0_u8; REPLY_CAPACITY];
         let outcome = reserved.scan(
@@ -302,6 +330,54 @@ impl<N: Network> ReservedScanner<N> {
                 keepalive_replies,
             }),
             keepalive_failure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    Waiting,
+    Pressed,
+    PoweredOff,
+    ReserveExpired,
+}
+
+impl ReservedScanner<SystemNetwork> {
+    /// Keeps the reservation alive and reads a bounded number of pending button datagrams.
+    ///
+    /// # Errors
+    ///
+    /// Returns a trigger socket error that prevents listening.
+    pub fn poll_trigger(&mut self, recent: &mut RecentPresses) -> io::Result<Trigger> {
+        let now = self.connected.clock.now();
+        let replies = self.connected.keepalive.replies();
+        self.connected.keepalive.tick(now);
+        if self.connected.keepalive.replies() != replies {
+            self.last_answer = now;
+        }
+        let mut buffer = [0; PACKET_LENGTH.saturating_add(1)];
+        for _ in 0..TRIGGERS_PER_POLL {
+            let (length, sender) = match self.connected.trigger.recv_from(&mut buffer) {
+                Ok(received) => received,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if sender.ip() != IpAddr::V4(self.connected.scanner) {
+                continue;
+            }
+            match buffer.get(..length).and_then(ButtonEvent::decode) {
+                Some(ButtonEvent::Press(sequence)) if recent.accept(sequence) => {
+                    return Ok(Trigger::Pressed);
+                }
+                Some(ButtonEvent::PowerOff) => return Ok(Trigger::PoweredOff),
+                Some(ButtonEvent::Press(_)) | None => {}
+            }
+        }
+        if now.millis().saturating_sub(self.last_answer.millis()) >= RESERVE_TIMEOUT_MILLIS {
+            Ok(Trigger::ReserveExpired)
+        } else {
+            Ok(Trigger::Waiting)
         }
     }
 }
