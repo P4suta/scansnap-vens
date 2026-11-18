@@ -1,0 +1,71 @@
+name: Propose release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-proposal
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    name: Prepare the draft release proposal
+    if: >-
+      github.repository == 'P4suta/scansnap-vens' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected &&
+      vars.RELEASE_PROPOSALS_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release-proposal
+    env:
+      RELEASE_TOOL: aqua:release-plz/release-plz@0.4.3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          version: "2026.11.9"
+          install_args: rust
+          cache: false
+      - name: Install the pinned proposal tool
+        run: mise install "$RELEASE_TOOL"
+      - name: Fetch the release-plz App credentials
+        id: credentials
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          doppler-token: ${{ secrets.DOPPLER_TOKEN }}
+          inject-env-vars: false
+      - name: Check the credential inputs
+        env:
+          APP_INPUTS_VALID: >-
+            ${{ steps.credentials.outputs.GITHUB_APP_CLIENT_ID != '' &&
+            steps.credentials.outputs.GITHUB_APP_PRIVATE_KEY != '' &&
+            !startsWith(steps.credentials.outputs.GITHUB_APP_CLIENT_ID, '${') &&
+            !startsWith(steps.credentials.outputs.GITHUB_APP_PRIVATE_KEY, '${') }}
+        run: test "$APP_INPUTS_VALID" = true
+      - name: Mint a token for the release proposal
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ steps.credentials.outputs.GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ steps.credentials.outputs.GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: scansnap-vens
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Set the proposal commit author
+        uses: release-plz/git-config@59144859caf016f8b817a2ac9b051578729173c4
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+      - name: Create or update the draft release proposal
+        env:
+          GIT_TOKEN: ${{ steps.app.outputs.token }}
+        run: mise x "$RELEASE_TOOL" -- release-plz release-pr --repo-url https://github.com/P4suta/scansnap-vens
