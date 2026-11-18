@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full commit SHA of the protected main branch at dispatch
+        description: Full commit SHA in the history of protected main
         required: true
         type: string
       version:
@@ -44,8 +44,8 @@ jobs:
       - name: Check the requested source and version
         shell: bash
         run: |
-          if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" == "$GITHUB_SHA" ]]; then
-            echo "::error::Dispatch with the full commit SHA from protected main"
+          if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Use the full commit SHA from protected main"
             exit 1
           fi
           if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -59,7 +59,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Select the requested commit from main
+        shell: bash
+        run: |
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA"; then
+            echo "::error::The requested commit is outside the history of protected main"
+            exit 1
+          fi
+          git switch --detach "$SOURCE_SHA"
       - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: "2026.11.9"
@@ -84,8 +93,10 @@ jobs:
           mkdir -p "$work/$bundle" "$work/assets" "$work/extracted"
           install -m 0755 "$work/build/release/vens" "$work/build/release/vensd" "$work/$bundle"
           install -m 0644 LICENSE-APACHE LICENSE-MIT "$work/$bundle"
+          git rev-parse HEAD > "$work/$bundle/SOURCE_COMMIT"
           tar -czf "$work/assets/$bundle.tar.gz" -C "$work" "$bundle"
           tar -xzf "$work/assets/$bundle.tar.gz" -C "$work/extracted"
+          test "$(<"$work/extracted/$bundle/SOURCE_COMMIT")" = "$SOURCE_SHA"
           "$work/extracted/$bundle/vens" --help
           "$work/extracted/$bundle/vensd" --help
           "$work/extracted/$bundle/vensd" avahi-service > "$work/avahi.service"
@@ -107,8 +118,17 @@ jobs:
             .bomFormat == "CycloneDX" and
             .metadata.component.name == "scansnap-vens" and
             .metadata.component.version == $version and
-            (.components | any(.name == "pdf-writer"))
+            (.components | type == "array")
           ' "$output/$source.cdx.json"
+          mise install aqua:mikefarah/yq@4.54.3
+          mapfile -d '' lockfiles < <(git ls-files -z -- Cargo.lock '*/Cargo.lock')
+          test "${#lockfiles[@]}" -gt 0
+          mise x aqua:mikefarah/yq@4.54.3 -- yq eval-all -p=toml -o=yaml -N -r \
+            '.package[] | [.name, .version] | @tsv' "${lockfiles[@]}" |
+            LC_ALL=C sort -u > target/release-candidate/locked-packages.tsv
+          jq -r '.components[] | select(.type != "file") | [.name, .version] | @tsv' "$output/$source.cdx.json" |
+            LC_ALL=C sort -u > target/release-candidate/inventory-packages.tsv
+          diff -u target/release-candidate/locked-packages.tsv target/release-candidate/inventory-packages.tsv
       - name: Record and verify archive hashes
         working-directory: target/release-candidate/assets
         shell: bash

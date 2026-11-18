@@ -14,7 +14,8 @@ Revoke the old Service Token after the access check passes.
 
 ## Build the candidate
 
-Select the product version from the merged proposal and the full commit SHA from `main`.
+Select the product version from the merged proposal and its full commit SHA.
+The build accepts a commit in the history of protected `main`.
 Dispatch [Build release candidate](https://github.com/P4suta/scansnap-vens/actions/workflows/build-release-candidate.yml) on `main` with both values.
 
 ```sh
@@ -24,14 +25,17 @@ gh workflow run build-release-candidate.yml --ref main \
 
 The job checks the locked version and exercises both commands from each archive.
 Download the Linux and macOS artifacts from the same successful run within seven days.
-The Linux artifact includes the source archive and a CycloneDX inventory of the locked dependencies.
+The Linux artifact includes the source archive and a CycloneDX inventory.
+The build compares the inventory with every tracked Cargo lockfile.
 Check each downloaded set with its `SHA256SUMS` file.
-Verify that each file's [build provenance](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) names the workflow and selected commit.
+Verify each file's [build provenance](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) for the workflow on `main`.
+Compare the selected commit with `SOURCE_COMMIT` inside each binary archive.
+Read the source archive's commit from the unpacked tar stream with `git get-tar-commit-id`.
 
 ```sh
 gh attestation verify "$asset" --repo P4suta/scansnap-vens \
   --signer-workflow P4suta/scansnap-vens/.github/workflows/build-release-candidate.yml \
-  --source-digest "$source_sha"
+  --source-ref refs/heads/main
 ```
 
 ## Publish the verified files
