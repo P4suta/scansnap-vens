@@ -11,6 +11,7 @@ pub mod keepalive;
 pub mod scan;
 pub mod sense;
 pub mod status;
+pub mod trigger;
 mod wire;
 
 pub use identity::{HostId, Ipv4Address, MacAddress, Port};

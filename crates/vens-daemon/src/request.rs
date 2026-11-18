@@ -11,12 +11,7 @@ const PWG: &str = "http://www.pwg.org/schemas/2010/12/sm";
 const SCAN: &str = "http://schemas.hp.com/imaging/escl/2011/05/03";
 /// Bounds the parse of a `ScanSettings` body, which clients send with a few dozen nodes.
 const NODES_LIMIT: u32 = 256;
-/// The media types that a browser form sends without asking the server first.
-const FORM_TYPES: [&str; 3] = [
-    "text/plain",
-    "application/x-www-form-urlencoded",
-    "multipart/form-data",
-];
+const XML_TYPES: [&str; 2] = ["text/xml", "application/xml"];
 
 /// A job request whose body isn't a `ScanSettings` document.
 struct Unreadable;
@@ -28,18 +23,68 @@ fn value<'a>(root: Node<'a, '_>, namespace: &str, name: &str) -> Option<&'a str>
         .map(str::trim)
 }
 
-/// Tells a body that a web page could have sent through a browser form from a scan client's body.
-fn from_a_form(content_type: Option<&str>) -> bool {
-    content_type.is_some_and(|media| {
-        let essence = media.split_once(';').map_or(media, |(essence, _)| essence);
-        FORM_TYPES
-            .iter()
-            .any(|form| essence.trim().eq_ignore_ascii_case(form))
-    })
+fn token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn after_parameter_value(value: &str) -> Option<&str> {
+    let Some(quoted) = value.strip_prefix('"') else {
+        let length = value.bytes().take_while(|&byte| token_byte(byte)).count();
+        return if length == 0 {
+            None
+        } else {
+            value.get(length..)
+        };
+    };
+    let mut escaped = false;
+    for (offset, byte) in quoted.bytes().enumerate() {
+        if (byte < b' ' && byte != b'\t') || byte == 0x7f {
+            return None;
+        }
+        match (escaped, byte) {
+            (true, _) => escaped = false,
+            (false, b'\\') => escaped = true,
+            (false, b'"') => return quoted.get(offset.saturating_add(1)..),
+            (false, _) => {}
+        }
+    }
+    None
+}
+
+fn xml_media_type(content_type: Option<&str>) -> bool {
+    let Some(media) = content_type.map(|value| value.trim_matches([' ', '\t'])) else {
+        return false;
+    };
+    let (essence, mut remaining) = media.split_at(media.find(';').unwrap_or(media.len()));
+    if !XML_TYPES.iter().any(|xml| {
+        essence
+            .trim_end_matches([' ', '\t'])
+            .eq_ignore_ascii_case(xml)
+    }) {
+        return false;
+    }
+    while let Some(parameter) = remaining.strip_prefix(';') {
+        let parameter = parameter.trim_start_matches([' ', '\t']);
+        if parameter.is_empty() || parameter.starts_with(';') {
+            remaining = parameter;
+            continue;
+        }
+        let Some((name, value)) = parameter.split_once('=') else {
+            return false;
+        };
+        if name.is_empty() || !name.bytes().all(token_byte) {
+            return false;
+        }
+        let Some(rest) = after_parameter_value(value) else {
+            return false;
+        };
+        remaining = rest.trim_start_matches([' ', '\t']);
+    }
+    remaining.is_empty()
 }
 
 fn scan_settings(request: &HttpRequest) -> Result<Result<JobSettings, Unsupported>, Unreadable> {
-    if from_a_form(request.content_type.as_deref()) {
+    if !xml_media_type(request.content_type.as_deref()) {
         return Err(Unreadable);
     }
     let text = str::from_utf8(&request.body).map_err(|_| Unreadable)?;
@@ -65,8 +110,7 @@ fn scan_settings(request: &HttpRequest) -> Result<Result<JobSettings, Unsupporte
 
 /// Names the bridge request for a read HTTP request, with the settings of a job request.
 ///
-/// A job request with a media type that a browser form sends is malformed, which stops a plain form on a web page.
-/// A page script can still send a body without a media type, which an allow-list of XML types would stop once Image Capture's type is known.
+/// A job request must declare an XML media type.
 #[must_use]
 pub fn escl_request(request: &HttpRequest) -> Request {
     match route(&request.method, &request.target) {

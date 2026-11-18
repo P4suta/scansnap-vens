@@ -1,6 +1,6 @@
 ---
 date: 2026-11-16
-status: proposed
+status: accepted
 ---
 
 # Serve eSCL from a small blocking server and the system responder
@@ -29,6 +29,6 @@ Deployment installs the Avahi service file.
 
 ## Confirmation
 
-On 2026-11-16 sane-airscan on a Linux machine scanned through a direct URL.
-Image Capture found the bridge through Bonjour and scanned on the same day.
+On 2026-11-16 sane-airscan scanned through a direct URL, and Image Capture scanned through Bonjour.
+On 2026-11-18 Avahi resolved port 8090 from the generated service file.
 Reconsider when a client needs keep-alive or HTTPS.

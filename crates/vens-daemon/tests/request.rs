@@ -18,7 +18,7 @@ fn http(method: &str, target: &str, body: &str) -> HttpRequest {
         method: method.to_owned(),
         target: target.to_owned(),
         user_agent: None,
-        content_type: None,
+        content_type: Some("text/xml".to_owned()),
         body: body.as_bytes().to_vec(),
     }
 }
@@ -122,7 +122,7 @@ fn an_unsupported_setting_reaches_the_bridge_by_name() {
 }
 
 #[test]
-fn a_job_request_with_a_media_type_that_a_browser_form_sends_is_malformed() {
+fn a_job_request_needs_an_xml_media_type() {
     let body = settings(("scan", "pwg"), "<scan:Duplex>true</scan:Duplex>");
     let typed = |media: Option<&str>| {
         escl_request(&HttpRequest {
@@ -138,7 +138,12 @@ fn a_job_request_with_a_media_type_that_a_browser_form_sends_is_malformed() {
             typed(Some("multipart/form-data; boundary=x")),
             typed(Some("text/xml")),
             typed(Some("application/xml; charset=utf-8")),
+            typed(Some(r#"Text/XML; charset="UTF-8"; profile="a,b;c\"d""#)),
+            typed(Some("text/xml; charset=utf-8, text/plain")),
+            typed(Some(r#"text/xml; charset="UTF-8"oops"#)),
+            typed(Some("text/xml; charset=")),
             typed(None),
+            typed(Some("application/octet-stream")),
         ],
         [
             Request::Malformed,
@@ -148,6 +153,11 @@ fn a_job_request_with_a_media_type_that_a_browser_form_sends_is_malformed() {
             duplex(),
             duplex(),
             duplex(),
+            Request::Malformed,
+            Request::Malformed,
+            Request::Malformed,
+            Request::Malformed,
+            Request::Malformed,
         ]
     );
 }

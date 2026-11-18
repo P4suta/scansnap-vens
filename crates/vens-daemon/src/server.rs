@@ -1,27 +1,34 @@
 use std::{
+    collections::VecDeque,
+    convert::Infallible,
     fmt::Debug,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    sync::mpsc::{self, Receiver, Sender},
+    path::PathBuf,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread::{self, Scope},
     time::{Duration, Instant},
 };
 
 use vens_core::jpeg::{components, frame_size};
 use vens_escl::{
-    bridge::{Bridge, Effect, Input, Moment, Refusal, Request, Response, Side},
+    bridge::{
+        Bridge, Effect, Input, Moment, Observation, Refusal, Request, Response, Side, Unavailable,
+    },
     uuid::Uuid,
 };
-use vens_net::network::Network;
+use vens_net::{host::SystemNetwork, network::Network};
 
 use crate::{
+    button,
     http::{Limits, read_request, refusal, refusal_status, status, write_refusal, write_response},
     job::{JobEvent, Report, run_job},
     request::escl_request,
 };
 
-/// The connections that the daemon reads at the same time, so a waiting request leaves room for others.
-const ACCEPTORS: usize = 4;
+const CONNECTIONS_PER_LISTENER: usize = 32;
+const PEER_CHECK: Duration = Duration::from_millis(10);
+const PEER_POLL: Duration = Duration::from_millis(100);
 /// The pages that a job keeps for its client, both sides of 128 sheets.
 const QUEUE: usize = 256;
 /// The pause after a failed accept, so a lasting failure doesn't spin.
@@ -39,6 +46,11 @@ pub struct Config {
     /// The time that a whole request may take to arrive.
     pub request_timeout: Duration,
     pub write_timeout: Duration,
+}
+
+pub struct Capture {
+    pub folder: PathBuf,
+    pub network: SystemNetwork,
 }
 
 /// Supplies the network that each job uses.
@@ -59,31 +71,215 @@ struct JobRequest {
     body: String,
 }
 
+type ConnectionSlot = Sender<Infallible>;
+
 struct Responder {
     line: String,
     job: Option<JobRequest>,
-    reply: Sender<Response<Vec<u8>>>,
+    reply: Sender<Reply>,
+    starter: Option<Receiver<()>>,
+}
+
+enum Acknowledge {
+    None,
+    Page {
+        id: Uuid,
+        events: Sender<Event>,
+    },
+    Observation {
+        id: Uuid,
+        observation: Observation,
+        events: Sender<Event>,
+    },
+}
+
+struct Reply {
+    response: Response<Vec<u8>>,
+    acknowledge: Acknowledge,
+}
+
+impl Reply {
+    fn completion(&mut self, success: bool) -> Option<(Sender<Event>, Event)> {
+        match std::mem::replace(&mut self.acknowledge, Acknowledge::None) {
+            Acknowledge::Page { id, events } => {
+                let returned = if success {
+                    None
+                } else if let Response::Page(page) =
+                    std::mem::replace(&mut self.response, Response::NotFound)
+                {
+                    Some(page)
+                } else {
+                    None
+                };
+                Some((events, Event::Transfer { id, returned }))
+            }
+            Acknowledge::Observation {
+                id,
+                observation,
+                events,
+            } => Some((
+                events,
+                Event::ObservationWritten {
+                    id,
+                    observation,
+                    success,
+                },
+            )),
+            Acknowledge::None => None,
+        }
+    }
+
+    fn written(&mut self, success: bool) {
+        if let Some((events, event)) = self.completion(success) {
+            let _ = events.send(event);
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        self.written(false);
+    }
 }
 
 enum Event {
     Request {
         request: Request,
         responder: Responder,
+        slot: ConnectionSlot,
     },
     Job(JobEvent),
-    Line(String),
+    Transfer {
+        id: Uuid,
+        returned: Option<Vec<u8>>,
+    },
+    ObservationWritten {
+        id: Uuid,
+        observation: Observation,
+        success: bool,
+    },
+    Line(String, Option<ConnectionSlot>),
 }
 
-struct ToOwner(Sender<Event>);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingWrite {
+    Page(Uuid),
+    NoPaper(Uuid),
+}
+
+#[derive(Default)]
+struct PendingReplies {
+    writes: Vec<PendingWrite>,
+    requests: VecDeque<Event>,
+}
+
+impl PendingReplies {
+    fn track(&mut self, ack: &Acknowledge) {
+        let write = match *ack {
+            Acknowledge::Page { id, .. } => PendingWrite::Page(id),
+            Acknowledge::Observation {
+                id,
+                observation: Observation::NoPaper,
+                ..
+            } => PendingWrite::NoPaper(id),
+            Acknowledge::None
+            | Acknowledge::Observation {
+                observation: Observation::Fault(_),
+                ..
+            } => return,
+        };
+        self.writes.push(write);
+    }
+
+    fn finish(&mut self, event: &Event) {
+        let write = match *event {
+            Event::Transfer { id, .. }
+            | Event::Request {
+                request: Request::DeleteJob(id),
+                ..
+            } => PendingWrite::Page(id),
+            Event::ObservationWritten {
+                id,
+                observation: Observation::NoPaper,
+                ..
+            } => PendingWrite::NoPaper(id),
+            Event::Request { .. }
+            | Event::Job(_)
+            | Event::ObservationWritten {
+                observation: Observation::Fault(_),
+                ..
+            }
+            | Event::Line(..) => return,
+        };
+        self.writes.retain(|&pending| pending != write);
+    }
+
+    fn waits(&self, event: &Event) -> bool {
+        let Event::Request { request, .. } = event else {
+            return false;
+        };
+        match request {
+            Request::Status => self
+                .writes
+                .iter()
+                .any(|write| matches!(write, PendingWrite::NoPaper(_))),
+            Request::NextDocument(id) => self.writes.contains(&PendingWrite::Page(*id)),
+            Request::Capabilities
+            | Request::CreateJob(_)
+            | Request::DeleteJob(_)
+            | Request::Unrouted(_)
+            | Request::Malformed => false,
+        }
+    }
+
+    fn next(&mut self, inbox: &Receiver<Event>) -> Option<Event> {
+        if let Some(ready) = self.requests.iter().position(|event| !self.waits(event)) {
+            return self.requests.remove(ready);
+        }
+        while let Ok(event) = inbox.recv() {
+            if !self.waits(&event) {
+                return Some(event);
+            }
+            self.requests.push_back(event);
+        }
+        None
+    }
+}
+
+struct ToOwner {
+    events: Sender<Event>,
+    created: Receiver<()>,
+}
 
 impl Report for ToOwner {
     fn report(&mut self, event: JobEvent) {
-        let _ = self.0.send(Event::Job(event));
+        let _ = self.events.send(Event::Job(event));
+    }
+
+    fn client_waiting(&mut self) -> bool {
+        self.created.try_recv() == Err(TryRecvError::Empty)
+    }
+
+    fn created(&mut self, mut while_waiting: impl FnMut()) -> bool {
+        if self.events.send(Event::Job(JobEvent::Reserved)).is_err() {
+            return false;
+        }
+        loop {
+            match self.created.recv_timeout(PEER_POLL) {
+                Ok(()) => return true,
+                Err(RecvTimeoutError::Timeout) => while_waiting(),
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
     }
 }
 
 fn line(events: &Sender<Event>, text: String) {
-    let _ = events.send(Event::Line(text));
+    let _ = events.send(Event::Line(text, None));
+}
+
+fn connection_line(events: &Sender<Event>, text: String, slot: ConnectionSlot) {
+    let _ = events.send(Event::Line(text, Some(slot)));
 }
 
 /// A connection whose reads share one deadline, so a client can't stretch a request by trickling its bytes.
@@ -93,19 +289,34 @@ struct Deadline<'a> {
     limit: Duration,
 }
 
-impl Read for Deadline<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+impl<'a> Deadline<'a> {
+    fn new(stream: &'a mut TcpStream, limit: Duration) -> Self {
+        Self {
+            stream,
+            started: Instant::now(),
+            limit,
+        }
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
         let remaining = self.limit.saturating_sub(self.started.elapsed());
         if remaining.is_zero() {
             return Err(io::Error::from(io::ErrorKind::TimedOut));
         }
-        self.stream.set_read_timeout(Some(remaining))?;
+        Ok(remaining)
+    }
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
         self.stream.read(buffer)
     }
 }
 
 impl Write for Deadline<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
         self.stream.write(bytes)
     }
 
@@ -114,33 +325,93 @@ impl Write for Deadline<'_> {
     }
 }
 
-fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Sender<Event>) {
-    if let Err(error) = stream.set_write_timeout(Some(config.write_timeout)) {
-        return line(events, format!("{peer} timeouts failed: {error}"));
+fn peer_waiting(stream: &TcpStream) -> bool {
+    match stream.peek(&mut [0_u8; 1]) {
+        Ok(_) => true,
+        Err(error) => matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        ),
     }
-    let mut deadline = Deadline {
-        stream: &mut stream,
-        started: Instant::now(),
-        limit: config.request_timeout,
+}
+
+fn await_reply(
+    answers: &Receiver<Reply>,
+    stream: &TcpStream,
+    timeout: Duration,
+) -> Result<Reply, RecvTimeoutError> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(RecvTimeoutError::Timeout);
+        }
+        match answers.recv_timeout(remaining.min(PEER_POLL)) {
+            Ok(reply) => return Ok(reply),
+            Err(RecvTimeoutError::Timeout) if peer_waiting(stream) => {}
+            Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+        }
+    }
+}
+
+fn reject_wait(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    timeout: Duration,
+    events: &Sender<Event>,
+    slot: ConnectionSlot,
+) {
+    let response = Response::<Vec<u8>>::Unavailable(Unavailable::ScannerBusy);
+    let written = write_response(&mut Deadline::new(stream, timeout), &response);
+    let text = match written {
+        Ok(()) => format!("{peer} job request wait expired 503 ScannerBusy"),
+        Err(error) => format!("{peer} job request wait expired, write failed: {error}"),
     };
-    let request = match read_request(&mut deadline, config.limits) {
+    connection_line(events, text, slot);
+}
+
+fn answer(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    config: Config,
+    events: &Sender<Event>,
+    slot: ConnectionSlot,
+) {
+    let request = match read_request(
+        &mut Deadline::new(&mut stream, config.request_timeout),
+        config.limits,
+    ) {
         Ok(request) => request,
         Err(error) => {
             let text = match refusal(error) {
                 Some(refusal) => {
                     let (code, _) = refusal_status(refusal);
-                    let written = write_refusal(&mut stream, refusal)
-                        .err()
-                        .map_or_else(String::new, |failure| format!(", write failed: {failure}"));
+                    let written = write_refusal(
+                        &mut Deadline::new(&mut stream, config.write_timeout),
+                        refusal,
+                    )
+                    .err()
+                    .map_or_else(String::new, |failure| format!(", write failed: {failure}"));
                     format!("{peer} unreadable request {error:?} {code}{written}")
                 }
                 None => format!("{peer} request ended: {error:?}"),
             };
-            return line(events, text);
+            return connection_line(events, text, slot);
         }
     };
+    if let Err(error) = stream.set_read_timeout(Some(PEER_CHECK)) {
+        return connection_line(events, format!("{peer} timeouts failed: {error}"), slot);
+    }
     let (reply, answers) = mpsc::channel();
     let escl = escl_request(&request);
+    let (created, starter) = if matches!(escl, Request::CreateJob(Ok(_))) {
+        let (created, starter) = mpsc::channel();
+        (Some(created), Some(starter))
+    } else {
+        (None, None)
+    };
     let job = matches!(escl, Request::CreateJob(_) | Request::Malformed).then(|| JobRequest {
         client: format!(
             "client {:?}, type {:?}",
@@ -160,28 +431,76 @@ fn answer(mut stream: TcpStream, peer: SocketAddr, config: Config, events: &Send
         ),
         job,
         reply,
+        starter,
     };
     if events
         .send(Event::Request {
             request: escl,
             responder,
+            slot: slot.clone(),
         })
         .is_err()
     {
         return;
     }
-    let Ok(response) = answers.recv() else {
-        return;
+    let mut reply = match await_reply(&answers, &stream, config.write_timeout) {
+        Ok(reply) => reply,
+        Err(error) => {
+            let job_timed_out = error == RecvTimeoutError::Timeout && created.is_some();
+            drop(answers);
+            drop(created);
+            if job_timed_out {
+                reject_wait(&mut stream, peer, config.write_timeout, events, slot);
+            }
+            return;
+        }
     };
-    if let Err(error) = write_response(&mut stream, &response) {
-        line(events, format!("{peer} write failed: {error}"));
+    let written = write_response(
+        &mut Deadline::new(&mut stream, config.write_timeout),
+        &reply.response,
+    );
+    if let Err(error) = written {
+        return connection_line(events, format!("{peer} write failed: {error}"), slot);
     }
+    if matches!(reply.response, Response::Created(_))
+        && let Some(created) = created
+    {
+        let _ = created.send(());
+    }
+    reply.written(true);
 }
 
-fn accept(listener: &TcpListener, config: Config, events: &Sender<Event>) {
+fn accept<'scope>(
+    scope: &'scope Scope<'scope, '_>,
+    listener: &TcpListener,
+    config: Config,
+    events: &Sender<Event>,
+) {
+    let mut slots: Vec<Receiver<Infallible>> = Vec::with_capacity(CONNECTIONS_PER_LISTENER);
     loop {
         match listener.accept() {
-            Ok((stream, peer)) => answer(stream, peer, config, events),
+            Ok((stream, peer)) => {
+                slots.retain(|slot| slot.try_recv() == Err(TryRecvError::Empty));
+                if slots.len() >= CONNECTIONS_PER_LISTENER {
+                    continue;
+                }
+                let (slot, held) = mpsc::channel();
+                slots.push(held);
+                let messages = events.clone();
+                let handler_slot = slot.clone();
+                let spawned = thread::Builder::new()
+                    .name("vensd request".to_owned())
+                    .spawn_scoped(scope, move || {
+                        answer(stream, peer, config, &messages, handler_slot);
+                    });
+                if let Err(error) = spawned {
+                    connection_line(
+                        events,
+                        format!("a request thread couldn't start: {error}"),
+                        slot,
+                    );
+                }
+            }
             Err(error) => {
                 line(events, format!("accept failed: {error}"));
                 thread::sleep(ACCEPT_BACKOFF);
@@ -198,24 +517,23 @@ fn start_job<'scope, S: Networks>(
     scope: &'scope Scope<'scope, '_>,
     networks: &mut S,
     target: Ipv4Addr,
-    events: &Sender<Event>,
+    mut report: ToOwner,
 ) {
-    let mut fallback = ToOwner(events.clone());
     let Some(mut network) = networks.network() else {
-        return fallback.report(JobEvent::Refused {
+        return report.report(JobEvent::Refused {
             refusal: Refusal::Unreachable,
             detail: "no network for the job".to_owned(),
         });
     };
-    let mut report = ToOwner(events.clone());
+    let events = report.events.clone();
     let spawned = thread::Builder::new()
         .name("vensd job".to_owned())
         .spawn_scoped(scope, move || run_job(&mut network, target, &mut report));
     if let Err(error) = spawned {
-        fallback.report(JobEvent::Refused {
+        let _ = events.send(Event::Job(JobEvent::Refused {
             refusal: Refusal::Unreachable,
             detail: format!("the job thread couldn't start: {error}"),
-        });
+        }));
     }
 }
 
@@ -246,31 +564,81 @@ fn reason<P>(response: &Response<P>) -> String {
     }
 }
 
-fn input<L: Log>(event: Event, log: &mut L) -> Option<Input<Responder, Vec<u8>>> {
-    match event {
-        Event::Request { request, responder } => Some(Input::Request { request, responder }),
+type OwnerInput = Input<Responder, Vec<u8>>;
+
+fn to_input<L: Log>(event: Event, log: &mut L) -> Option<OwnerInput> {
+    let input = match event {
+        Event::Request {
+            request,
+            responder,
+            slot,
+        } => {
+            drop(slot);
+            Input::Request { request, responder }
+        }
         Event::Job(JobEvent::Reserved) => {
             log.record("job reserved the scanner");
-            Some(Input::Reserved)
+            Input::Reserved
+        }
+        Event::Job(JobEvent::Abandoned { detail }) => {
+            let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
+            log.record(&format!("job client left before the scan{detail}"));
+            Input::Abandoned
         }
         Event::Job(JobEvent::Refused { refusal, detail }) => {
             log.record(&format!("job refused: {refusal:?} ({detail})"));
-            Some(Input::Refused(refusal))
+            Input::Refused(refusal)
         }
         Event::Job(JobEvent::Page { side, page }) => {
             log.record(&page_line(side, &page));
-            Some(Input::Page { side, page })
+            Input::Page { side, page }
         }
+        Event::Transfer { id, returned } => Input::PageWritten { id, returned },
+        Event::ObservationWritten {
+            id,
+            observation,
+            success,
+        } => Input::ObservationWritten {
+            id,
+            observation,
+            success,
+        },
         Event::Job(JobEvent::Finished { ending, detail }) => {
             let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
             log.record(&format!("job finished: {ending:?}{detail}"));
-            Some(Input::Finished(ending))
+            Input::Finished(ending)
         }
-        Event::Line(text) => {
+        Event::Line(text, slot) => {
             log.record(&text);
-            None
+            drop(slot);
+            return None;
         }
+    };
+    Some(input)
+}
+
+fn respond<L: Log>(
+    responder: &Responder,
+    reply: Reply,
+    pending: &mut PendingReplies,
+    log: &mut L,
+) -> Option<Event> {
+    let (code, _) = status(&reply.response);
+    let reason = reason(&reply.response);
+    pending.track(&reply.acknowledge);
+    if let Err(mut undelivered) = responder.reply.send(reply) {
+        log.record(&format!("{} response receiver closed", responder.line));
+        return undelivered.0.completion(false).map(|(_, event)| event);
     }
+    let client = responder
+        .job
+        .as_ref()
+        .map_or_else(String::new, |job| format!(" {}", job.client));
+    log.record(&format!("{} {code}{reason}{client}", responder.line));
+    if let (400..=599, Some(job)) = (code, &responder.job) {
+        log.record(&format!("{} body {:?}", responder.line, job.body));
+    }
+    None
 }
 
 fn own<'scope, S: Networks, L: Log>(
@@ -278,39 +646,99 @@ fn own<'scope, S: Networks, L: Log>(
     inbox: &Receiver<Event>,
     events: &Sender<Event>,
     networks: &mut S,
+    worker: Option<&Sender<ToOwner>>,
     config: Config,
     log: &mut L,
 ) {
-    let started = Instant::now();
+    let epoch = Instant::now();
     let mut bridge = Bridge::<Responder, Vec<u8>, QUEUE>::new(config.uuid, config.seed);
-    while let Ok(event) = inbox.recv() {
-        let Some(input) = input(event, log) else {
+    let mut pending = PendingReplies::default();
+    while let Some(event) = pending.next(inbox) {
+        pending.finish(&event);
+        let Some(mut input) = to_input(event, log) else {
             continue;
         };
-        let (next, effects) = bridge.handle(input, now(started));
+        let mut starter = if let Input::Request { responder, .. } = &mut input {
+            responder.starter.take()
+        } else {
+            None
+        };
+        let (next, effects) = bridge.handle(input, now(epoch));
         bridge = next;
         for effect in effects {
-            match effect {
+            let follow_up = match effect {
                 Effect::Reply {
                     responder,
                     response,
-                } => {
-                    let (code, _) = status(&response);
-                    let client = responder
-                        .job
-                        .as_ref()
-                        .map_or_else(String::new, |job| format!(" {}", job.client));
-                    log.record(&format!(
-                        "{} {code}{}{client}",
-                        responder.line,
-                        reason(&response)
-                    ));
-                    if let (400..=599, Some(job)) = (code, &responder.job) {
-                        log.record(&format!("{} body {:?}", responder.line, job.body));
+                } => respond(
+                    &responder,
+                    Reply {
+                        response,
+                        acknowledge: Acknowledge::None,
+                    },
+                    &mut pending,
+                    log,
+                ),
+                Effect::Transfer {
+                    responder,
+                    id,
+                    page,
+                } => respond(
+                    &responder,
+                    Reply {
+                        response: Response::Page(page),
+                        acknowledge: Acknowledge::Page {
+                            id,
+                            events: events.clone(),
+                        },
+                    },
+                    &mut pending,
+                    log,
+                ),
+                Effect::Observation {
+                    responder,
+                    id,
+                    observation,
+                } => respond(
+                    &responder,
+                    Reply {
+                        response: Response::Conflict(observation.conflict()),
+                        acknowledge: Acknowledge::Observation {
+                            id,
+                            observation,
+                            events: events.clone(),
+                        },
+                    },
+                    &mut pending,
+                    log,
+                ),
+                Effect::Start(_) => {
+                    let Some(created) = starter.take() else {
+                        let _ = events.send(Event::Job(JobEvent::Abandoned { detail: None }));
+                        continue;
+                    };
+                    let report = ToOwner {
+                        events: events.clone(),
+                        created,
+                    };
+                    if let Some(worker) = worker {
+                        if let Err(mut dropped) = worker.send(report) {
+                            dropped.0.report(JobEvent::Refused {
+                                refusal: Refusal::Unreachable,
+                                detail: "the button worker stopped".to_owned(),
+                            });
+                        }
+                    } else {
+                        start_job(scope, networks, config.target, report);
                     }
-                    let _ = responder.reply.send(response);
+                    None
                 }
-                Effect::Start(_) => start_job(scope, networks, config.target, events),
+            };
+            if let Some(event) = follow_up {
+                pending.finish(&event);
+                if let Some(input) = to_input(event, log) {
+                    (bridge, _) = bridge.handle(input, now(epoch));
+                }
             }
         }
     }
@@ -319,25 +747,183 @@ fn own<'scope, S: Networks, L: Log>(
 /// Serves eSCL clients on the listener and runs each job on a network from `networks`.
 ///
 /// One thread owns the bridge state, and the others only send it events: each accepted request, and each step of the running job.
-pub fn serve<S: Networks, L: Log>(
+pub fn serve<S: Networks, L: Log>(listeners: &[TcpListener], networks: S, config: Config, log: L) {
+    serve_configured(listeners, networks, config, log, None);
+}
+
+/// Serves eSCL and optionally starts a single worker for HTTP jobs and the Scan button.
+pub fn serve_configured<S: Networks, L: Log>(
     listeners: &[TcpListener],
     mut networks: S,
     config: Config,
     mut log: L,
+    capture: Option<Capture>,
 ) {
     let (events, inbox) = mpsc::channel();
     thread::scope(|scope| {
+        let worker = if let Some(capture) = capture {
+            let (jobs, work) = mpsc::channel();
+            let messages = events.clone();
+            let started = thread::Builder::new()
+                .name("vensd scanner".to_owned())
+                .spawn_scoped(scope, move || {
+                    button::run(
+                        capture.network,
+                        config.target,
+                        &capture.folder,
+                        &work,
+                        |text| {
+                            line(&messages, text.to_owned());
+                        },
+                    );
+                });
+            if let Err(error) = started {
+                log.record(&format!("the scanner worker couldn't start: {error}"));
+                return;
+            }
+            Some(jobs)
+        } else {
+            None
+        };
         for listener in listeners {
-            for _ in 0..ACCEPTORS {
-                let acceptor_events = events.clone();
-                let spawned = thread::Builder::new()
-                    .name("vensd acceptor".to_owned())
-                    .spawn_scoped(scope, move || accept(listener, config, &acceptor_events));
-                if let Err(error) = spawned {
-                    line(&events, format!("an acceptor couldn't start: {error}"));
-                }
+            let acceptor_events = events.clone();
+            let spawned = thread::Builder::new()
+                .name("vensd acceptor".to_owned())
+                .spawn_scoped(scope, move || {
+                    accept(scope, listener, config, &acceptor_events);
+                });
+            if let Err(error) = spawned {
+                line(&events, format!("an acceptor couldn't start: {error}"));
             }
         }
-        own(scope, &inbox, &events, &mut networks, config, &mut log);
+        own(
+            scope,
+            &inbox,
+            &events,
+            &mut networks,
+            worker.as_ref(),
+            config,
+            &mut log,
+        );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Shutdown;
+
+    use super::{
+        Acknowledge, Duration, Event, Ipv4Addr, Log, Observation, PendingReplies, PendingWrite,
+        Reply, Request, Responder, Response, TcpListener, TcpStream, TryRecvError, Uuid, mpsc,
+        peer_waiting, respond,
+    };
+
+    struct Ignore;
+
+    impl Log for Ignore {
+        fn record(&mut self, _: &str) {}
+    }
+
+    #[test]
+    fn a_closed_reply_receiver_returns_the_page_to_the_current_owner_turn() {
+        let (replies, receiver) = mpsc::channel();
+        drop(receiver);
+        let (events, inbox) = mpsc::channel();
+        let id = Uuid::from_bytes([3; 16]);
+        let returned = respond(
+            &Responder {
+                line: String::new(),
+                job: None,
+                reply: replies,
+                starter: None,
+            },
+            Reply {
+                response: Response::Page([1, 2].to_vec()),
+                acknowledge: Acknowledge::Page { id, events },
+            },
+            &mut PendingReplies::default(),
+            &mut Ignore,
+        );
+        assert!(
+            matches!(returned, Some(Event::Transfer { id: job, returned: Some(page) }) if job == id && page == [1, 2])
+        );
+        assert!(matches!(inbox.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn a_write_half_close_leaves_the_peer_available_for_a_reply() {
+        let observed = (|| {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+            let client = TcpStream::connect(listener.local_addr().ok()?).ok()?;
+            let (stream, _) = listener.accept().ok()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            client.shutdown(Shutdown::Write).ok()?;
+            let eof = stream.peek(&mut [0_u8; 1]).ok()?;
+            Some((eof, peer_waiting(&stream)))
+        })();
+        assert_eq!(observed, Some((0, true)));
+    }
+
+    #[test]
+    fn dependent_requests_wait_for_writes_without_delaying_other_requests() {
+        let id = Uuid::from_bytes([3; 16]);
+        let (traffic, inbox) = mpsc::channel();
+        let request = |request| Event::Request {
+            request,
+            responder: Responder {
+                line: String::new(),
+                job: None,
+                reply: mpsc::channel().0,
+                starter: None,
+            },
+            slot: mpsc::channel().0,
+        };
+        let mut pending = PendingReplies::default();
+        pending
+            .writes
+            .extend([PendingWrite::Page(id), PendingWrite::NoPaper(id)]);
+        for event in [
+            request(Request::NextDocument(id)),
+            request(Request::Status),
+            request(Request::Capabilities),
+            Event::Transfer { id, returned: None },
+            Event::ObservationWritten {
+                id,
+                observation: Observation::NoPaper,
+                success: false,
+            },
+        ] {
+            assert!(traffic.send(event).is_ok());
+        }
+        drop(traffic);
+        assert!(matches!(
+            pending.next(&inbox),
+            Some(Event::Request {
+                request: Request::Capabilities,
+                ..
+            })
+        ));
+        assert!(matches!(pending.next(&inbox), Some(Event::Transfer { .. })));
+        pending.finish(&Event::Transfer { id, returned: None });
+        assert!(
+            matches!(pending.next(&inbox), Some(Event::Request {request: Request::NextDocument(next), ..}) if next == id)
+        );
+        let result = Event::ObservationWritten {
+            id,
+            observation: Observation::NoPaper,
+            success: false,
+        };
+        assert!(matches!(
+            pending.next(&inbox),
+            Some(Event::ObservationWritten { .. })
+        ));
+        pending.finish(&result);
+        assert!(matches!(
+            pending.next(&inbox),
+            Some(Event::Request {
+                request: Request::Status,
+                ..
+            })
+        ));
+    }
 }

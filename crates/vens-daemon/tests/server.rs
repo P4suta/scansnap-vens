@@ -4,7 +4,7 @@
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpListener, TcpStream},
+    net::{Ipv4Addr, Shutdown, TcpListener, TcpStream},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -61,6 +61,13 @@ fn start_on<const L: usize>(
     config: Config,
     sessions: Vec<Vec<Event>>,
 ) -> Option<([u16; L], mpsc::Receiver<String>)> {
+    start_with(config, Fixtures(sessions.into()))
+}
+
+fn start_with<const L: usize>(
+    config: Config,
+    networks: impl Networks + Send + 'static,
+) -> Option<([u16; L], mpsc::Receiver<String>)> {
     let listeners = [(); L].map(|()| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok());
     let listeners: Vec<TcpListener> = listeners.into_iter().collect::<Option<_>>()?;
     let mut ports = [0; L];
@@ -68,7 +75,6 @@ fn start_on<const L: usize>(
         *port = listener.local_addr().ok()?.port();
     }
     let (lines, log) = mpsc::channel();
-    let networks = Fixtures(sessions.into());
     thread::spawn(move || serve(&listeners, networks, config, Lines(lines)));
     Some((ports, log))
 }
@@ -143,13 +149,13 @@ fn get(port: u16, path: &str) -> Option<Answer> {
 }
 
 fn post(port: u16, path: &str, body: &str) -> Option<Answer> {
-    exchange(
-        port,
-        format!(
-            "POST {path} HTTP/1.1\r\nHost: bridge\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .as_bytes(),
+    exchange(port, post_request(path, body).as_bytes())
+}
+
+fn post_request(path: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: bridge\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     )
 }
 
@@ -306,13 +312,13 @@ fn a_client_that_trickles_its_request_is_cut_off_at_the_request_deadline() {
 }
 
 #[test]
-fn three_silent_connections_leave_an_acceptor_for_another_client() {
+fn four_silent_connections_leave_an_acceptor_for_another_client() {
     let patient = Config {
         request_timeout: Duration::from_secs(3),
         ..CONFIG
     };
     let checks = start_on::<1>(patient, Vec::new()).and_then(|([port], _log)| {
-        let silent: Vec<TcpStream> = (0..3)
+        let silent: Vec<TcpStream> = (0..4)
             .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, port)).ok())
             .collect::<Option<_>>()?;
         let started = Instant::now();
@@ -322,6 +328,77 @@ fn three_silent_connections_leave_an_acceptor_for_another_client() {
         Some((answered, elapsed < Duration::from_secs(1)))
     });
     assert_eq!(checks, Some((200, true)));
+}
+
+#[test]
+fn a_job_that_times_out_before_reservation_gets_503_and_frees_the_bridge() {
+    struct Gated {
+        first: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl Networks for Gated {
+        type Network = FixtureNetwork;
+
+        fn network(&mut self) -> Option<FixtureNetwork> {
+            if let Some((started, proceed)) = self.first.take() {
+                started.send(()).ok()?;
+                proceed.recv_timeout(Duration::from_secs(5)).ok()?;
+            }
+            FixtureNetwork::new(events(ONE_SHEET))
+        }
+    }
+
+    let observed = (|| {
+        let (started, queued) = mpsc::channel();
+        let (proceed, hold) = mpsc::channel();
+        let ([port], log) = start_with(
+            Config {
+                write_timeout: Duration::from_millis(300),
+                ..CONFIG
+            },
+            Gated {
+                first: Some((started, hold)),
+            },
+        )?;
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).ok()?;
+        client.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        client
+            .write_all(post_request("/eSCL/ScanJobs", SETTINGS).as_bytes())
+            .ok()?;
+        queued.recv_timeout(Duration::from_secs(5)).ok()?;
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).ok()?;
+        let timed_out = parse(&answer)?;
+        proceed.send(()).ok()?;
+        let lines = lines_until(&log, |line| line.contains("client left"));
+        let next = post(port, "/eSCL/ScanJobs", SETTINGS)?;
+        Some((
+            (timed_out.code, timed_out.field("location").is_none()),
+            lines
+                .iter()
+                .any(|line| line.contains("client left before the scan")),
+            lines.iter().any(|line| line.contains("job reserved")),
+            next.code,
+        ))
+    })();
+    assert_eq!(observed, Some(((503, true), true, false, 201)));
+}
+
+#[test]
+fn a_client_that_half_closes_after_its_job_request_gets_the_created_response() {
+    let answer = start([events(ONE_SHEET)].to_vec()).and_then(|(port, _log)| {
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).ok()?;
+        client.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        client
+            .write_all(post_request("/eSCL/ScanJobs", SETTINGS).as_bytes())
+            .ok()?;
+        client.shutdown(Shutdown::Write).ok()?;
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).ok()?;
+        let response = parse(&bytes)?;
+        Some((response.code, response.field("location").is_some()))
+    });
+    assert_eq!(answer, Some((201, true)));
 }
 
 #[test]
@@ -355,7 +432,7 @@ fn a_refused_job_request_logs_its_reason_client_and_body() {
         exchange(
             port,
             format!(
-                "POST /eSCL/ScanJobs HTTP/1.1\r\nHost: bridge\r\nUser-Agent: AirScanScanner/58\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST /eSCL/ScanJobs HTTP/1.1\r\nHost: bridge\r\nUser-Agent: AirScanScanner/58\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -365,7 +442,7 @@ fn a_refused_job_request_logs_its_reason_client_and_body() {
     assert_eq!(
         lines.map(|lines| (
             lines.iter().any(|line| line.ends_with(
-                "POST /eSCL/ScanJobs 409 Unsupported(ColorMode) client \"AirScanScanner/58\", type \"none\""
+                "POST /eSCL/ScanJobs 409 Unsupported(ColorMode) client \"AirScanScanner/58\", type \"text/xml\""
             )),
             lines
                 .iter()

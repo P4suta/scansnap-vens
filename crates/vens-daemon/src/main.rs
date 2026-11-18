@@ -3,6 +3,7 @@ use std::{
     hash::{BuildHasher, RandomState},
     io::{self, Write},
     net::{Ipv4Addr, Ipv6Addr, TcpListener},
+    path::PathBuf,
     process::ExitCode,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +13,7 @@ use vens_daemon::{
     advertise::avahi_service,
     http::Limits,
     invocation::{self, Invocation, USAGE},
-    server::{self, Config, Log, Networks},
+    server::{self, Capture, Config, Log, Networks},
 };
 use vens_escl::uuid::Uuid;
 use vens_net::host::SystemNetwork;
@@ -92,8 +93,20 @@ fn bind(port: u16) -> io::Result<Vec<TcpListener>> {
     }
 }
 
-fn serve(port: u16, target: Ipv4Addr, uuid: Uuid) -> ExitCode {
+fn serve(port: u16, target: Ipv4Addr, uuid: Uuid, folder: Option<PathBuf>) -> ExitCode {
     let mut log = Stderr;
+    let capture = if let Some(folder) = folder {
+        if let Err(error) = tempfile::tempfile_in(&folder) {
+            log.record(&format!("can't write to {}: {error}", folder.display()));
+            return ExitCode::FAILURE;
+        }
+        Some(Capture {
+            folder,
+            network: SystemNetwork::new(PROBE_INTERVAL, DEADLINE),
+        })
+    } else {
+        None
+    };
     let listeners = match bind(port) {
         Ok(listeners) => listeners,
         Err(error) => {
@@ -121,7 +134,7 @@ fn serve(port: u16, target: Ipv4Addr, uuid: Uuid) -> ExitCode {
         request_timeout: REQUEST_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
     };
-    server::serve(&listeners, System, config, log);
+    server::serve_configured(&listeners, System, config, log, capture);
     ExitCode::FAILURE
 }
 
@@ -138,7 +151,13 @@ fn print(text: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     match invocation::parse(env::args_os().skip(1)) {
-        Ok(Invocation::Serve { port, target, uuid }) => serve(port, target, uuid),
+        Ok(Invocation::Serve { port, target, uuid }) => serve(port, target, uuid, None),
+        Ok(Invocation::Capture {
+            folder,
+            port,
+            target,
+            uuid,
+        }) => serve(port, target, uuid, Some(folder)),
         Ok(Invocation::AvahiService { port, uuid }) => print(&avahi_service(port, uuid)),
         Ok(Invocation::Help) => print(USAGE),
         Err(error) => {

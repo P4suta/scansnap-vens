@@ -15,7 +15,9 @@ workspace = true
 
 [dependencies]
 httparse.workspace = true
+pdf-writer.workspace = true
 roxmltree.workspace = true
+tempfile.workspace = true
 vens-core.workspace = true
 vens-escl.workspace = true
 vens-net.workspace = true

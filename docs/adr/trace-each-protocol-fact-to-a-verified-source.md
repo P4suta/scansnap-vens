@@ -1,6 +1,6 @@
 ---
 date: 2026-11-16
-status: proposed
+status: accepted
 ---
 
 # Trace each protocol fact to a verified source
@@ -32,4 +32,4 @@ Reconsider this rule when the vendor publishes a specification.
 ## Confirmation
 
 Each golden frame test cites its source section.
-The record stays proposed until the first hardware scan confirms the cited layouts.
+On 2026-11-16 the first hardware scan confirmed the layouts for discovery, reservation, scanning, and release.

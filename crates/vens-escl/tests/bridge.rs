@@ -5,8 +5,8 @@ use std::fmt::Debug;
 
 use vens_escl::{
     bridge::{
-        Bridge, Conflict, Effect, Ending, Fault, HINT_MILLIS, Input, Moment, RETENTION_MILLIS,
-        Refusal, Request, Response, Side, Unavailable,
+        Bridge, Conflict, Effect, Ending, Fault, HINT_MILLIS, Input, Moment, Observation,
+        RETENTION_MILLIS, Refusal, Request, Response, Side, Unavailable,
     },
     document::{AdfState, Capabilities, JobInfo, JobState, ScannerState, ScannerStatus},
     route::{Method, Unrouted},
@@ -50,7 +50,53 @@ fn feed<const N: usize>(
         (bridge, Log::new()),
         |(bridge, mut log), (millis, input)| {
             let (bridge, effects) = bridge.handle(input, Moment::from_millis(millis));
-            log.push(effects.into_iter().collect());
+            let (bridge, replies) =
+                effects
+                    .into_iter()
+                    .fold(
+                        (bridge, Vec::new()),
+                        |(bridge, mut replies), effect| match effect {
+                            Effect::Transfer {
+                                responder,
+                                id,
+                                page,
+                            } => {
+                                let (bridge, _) = bridge.handle(
+                                    Input::PageWritten { id, returned: None },
+                                    Moment::from_millis(millis),
+                                );
+                                replies.push(Effect::Reply {
+                                    responder,
+                                    response: Response::Page(page),
+                                });
+                                (bridge, replies)
+                            }
+                            Effect::Observation {
+                                responder,
+                                id,
+                                observation,
+                            } => {
+                                let (bridge, _) = bridge.handle(
+                                    Input::ObservationWritten {
+                                        id,
+                                        observation,
+                                        success: true,
+                                    },
+                                    Moment::from_millis(millis),
+                                );
+                                replies.push(Effect::Reply {
+                                    responder,
+                                    response: Response::Conflict(observation.conflict()),
+                                });
+                                (bridge, replies)
+                            }
+                            effect @ (Effect::Reply { .. } | Effect::Start(_)) => {
+                                replies.push(effect);
+                                (bridge, replies)
+                            }
+                        },
+                    );
+            log.push(replies);
             (bridge, log)
         },
     )
@@ -81,7 +127,10 @@ fn status_of<const N: usize>(
             response: Response::Status(status),
             ..
         } => Some(status),
-        Effect::Reply { .. } | Effect::Start(_) => None,
+        Effect::Reply { .. }
+        | Effect::Start(_)
+        | Effect::Transfer { .. }
+        | Effect::Observation { .. } => None,
     })
 }
 
@@ -91,7 +140,10 @@ fn created(effects: Option<&Effects>) -> Option<Uuid> {
             response: Response::Created(path),
             ..
         } => Some(path.job()),
-        Effect::Reply { .. } | Effect::Start(_) => None,
+        Effect::Reply { .. }
+        | Effect::Start(_)
+        | Effect::Transfer { .. }
+        | Effect::Observation { .. } => None,
     })
 }
 
@@ -551,6 +603,222 @@ fn a_failed_job_delivers_its_pages_and_then_a_conflict() {
                     adf: AdfState::Jam,
                     job: Some(info(id, 1, 0, JobState::Aborted)),
                 }),
+            ),
+        )
+    }));
+}
+
+#[test]
+fn a_drained_failure_waits_for_the_clients_next_page_request() {
+    let answer = started::<4>(duplex()).map(|(bridge, id)| {
+        let (_, log) = feed(
+            bridge,
+            [
+                (2, page(Side::Front, "front")),
+                (3, Input::Finished(Ending::Failed(Fault::Jam))),
+                (4, request(Request::NextDocument(id), "page")),
+                (
+                    HINT_MILLIS.saturating_mul(2),
+                    request(Request::NextDocument(id), "fault"),
+                ),
+            ],
+        );
+        log.into_iter().last()
+    });
+    assert_eq!(
+        answer.flatten(),
+        Some(reply(
+            "fault",
+            Response::Conflict(Conflict::Failed(Fault::Jam))
+        ))
+    );
+}
+
+#[test]
+fn an_unwritten_fault_still_answers_a_retry_after_the_hint_interval() {
+    check(started::<4>(duplex()).map(|(bridge, id)| {
+        let (waiting, _) = bridge.handle(
+            request(Request::NextDocument(id), "gone"),
+            Moment::from_millis(2),
+        );
+        let (ended, reply_for_gone_client) = waiting.handle(
+            Input::Finished(Ending::Failed(Fault::Jam)),
+            Moment::from_millis(3),
+        );
+        assert_eq!(
+            reply_for_gone_client.into_iter().next(),
+            Some(Effect::Observation {
+                responder: "gone",
+                id,
+                observation: Observation::Fault(Fault::Jam),
+            })
+        );
+        let retry = HINT_MILLIS.saturating_add(4);
+        let next = request(Request::NextDocument(id), "retry");
+        let (ended, _) = ended.handle(next.clone(), Moment::from_millis(retry));
+        let written = retry.saturating_add(HINT_MILLIS);
+        let (_, replies) = feed(
+            ended,
+            [
+                (written, next.clone()),
+                (written.saturating_add(1), next.clone()),
+                (written.saturating_add(HINT_MILLIS), next),
+            ],
+        );
+        (
+            replies,
+            [
+                reply("retry", Response::Conflict(Conflict::Failed(Fault::Jam))),
+                reply("retry", Response::Conflict(Conflict::Failed(Fault::Jam))),
+                reply("retry", Response::NotFound),
+            ]
+            .to_vec(),
+        )
+    }));
+}
+
+#[test]
+fn an_unread_zero_page_fault_expires_at_the_retention_deadline() {
+    let statuses = started::<4>(duplex()).map(|(bridge, _)| {
+        let (ended, _) = bridge.handle(
+            Input::Finished(Ending::Failed(Fault::Jam)),
+            Moment::from_millis(2),
+        );
+        let deadline = RETENTION_MILLIS.saturating_add(2);
+        [deadline.saturating_sub(1), deadline].map(|millis| {
+            status_of(&ended, millis)
+                .map(|status| (status.adf == AdfState::Jam, status.job.is_some()))
+        })
+    });
+    assert_eq!(statuses, Some([Some((true, true)), Some((false, false))]));
+}
+
+#[test]
+fn a_no_paper_hint_requires_a_written_response() {
+    let states = (|| {
+        let (starting, _) = Bridge4::new(UUID, SEED).handle(
+            request(Request::CreateJob(duplex()), "client"),
+            Moment::from_millis(1),
+        );
+        let (refused, pending) =
+            starting.handle(Input::Refused(Refusal::NoPaper), Moment::from_millis(2));
+        let Effect::Observation {
+            id,
+            observation: Observation::NoPaper,
+            ..
+        } = pending.into_iter().next()?
+        else {
+            return None;
+        };
+        let before = status_of(&refused, 3)?.adf;
+        let (observed, _) = refused.handle(
+            Input::ObservationWritten {
+                id,
+                observation: Observation::NoPaper,
+                success: true,
+            },
+            Moment::from_millis(4),
+        );
+        Some((before, status_of(&observed, 5)?.adf))
+    })();
+    assert_eq!(
+        states.map(|(before, after)| (before != AdfState::Empty, after)),
+        Some((true, AdfState::Empty))
+    );
+}
+
+#[test]
+fn a_fault_in_flight_can_complete_after_its_read_deadline() {
+    let states = started::<4>(duplex()).map(|(bridge, id)| {
+        let observation = Observation::Fault(Fault::Jam);
+        let deadline = RETENTION_MILLIS.saturating_add(2);
+        let next = request(Request::NextDocument(id), "client");
+        let (ended, _) = bridge.handle(
+            Input::Finished(Ending::Failed(Fault::Jam)),
+            Moment::from_millis(2),
+        );
+        let (writing, pending) = ended.handle(
+            next.clone(),
+            Moment::from_millis(deadline.saturating_sub(1)),
+        );
+        assert_eq!(
+            pending.into_iter().next(),
+            Some(Effect::Observation {
+                responder: "client",
+                id,
+                observation
+            })
+        );
+        let (expired, late) = writing.handle(next, Moment::from_millis(deadline));
+        assert_eq!(
+            late.into_iter().collect::<Effects>(),
+            reply("client", Response::NotFound)
+        );
+        [true, false].map(|success| {
+            let (settled, _) = expired.clone().handle(
+                Input::ObservationWritten {
+                    id,
+                    observation,
+                    success,
+                },
+                Moment::from_millis(deadline.saturating_add(1)),
+            );
+            status_of(&settled, deadline.saturating_add(2))
+                .map(|status| status.adf == AdfState::Jam)
+        })
+    });
+    assert_eq!(states, Some([Some(true), Some(false)]));
+}
+
+#[test]
+fn a_failed_write_keeps_the_same_page_at_the_front_of_the_job() {
+    check(started::<4>(duplex()).map(|(bridge, id)| {
+        let (bridge, _) = feed(
+            bridge,
+            [
+                (2, page(Side::Front, "front")),
+                (3, page(Side::Back, "back")),
+                (4, Input::Finished(Ending::Completed)),
+            ],
+        );
+        let (bridge, first) = bridge.handle(
+            request(Request::NextDocument(id), "first"),
+            Moment::from_millis(5),
+        );
+        let sent = |responder| Effect::Transfer {
+            responder,
+            id,
+            page: "front",
+        };
+        let before = status_of(&bridge, 6).and_then(|status| status.job);
+        let (bridge, _) = bridge.handle(
+            Input::PageWritten {
+                id,
+                returned: Some("front"),
+            },
+            Moment::from_millis(7),
+        );
+        let (bridge, retry) = bridge.handle(
+            request(Request::NextDocument(id), "retry"),
+            Moment::from_millis(8),
+        );
+        let (bridge, _) = bridge.handle(
+            Input::PageWritten { id, returned: None },
+            Moment::from_millis(9),
+        );
+        let after = status_of(&bridge, 10).and_then(|status| status.job);
+        (
+            (
+                first.into_iter().next(),
+                retry.into_iter().next(),
+                before,
+                after,
+            ),
+            (
+                Some(sent("first")),
+                Some(sent("retry")),
+                Some(info(id, 0, 2, JobState::Processing)),
+                Some(info(id, 1, 1, JobState::Processing)),
             ),
         )
     }));

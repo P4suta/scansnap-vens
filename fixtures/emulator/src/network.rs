@@ -123,7 +123,11 @@ impl Network for FixtureNetwork {
         })
     }
 
-    fn keepalive(&mut self, discovery: ObservedDatagram) -> Result<ObservedDatagram, ReplayError> {
+    fn keepalive(
+        &mut self,
+        discovery: ObservedDatagram,
+        _: Ipv4Addr,
+    ) -> Result<ObservedDatagram, ReplayError> {
         Ok(discovery)
     }
 

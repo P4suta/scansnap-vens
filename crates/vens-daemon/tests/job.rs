@@ -23,6 +23,7 @@ const RESULT: usize = 8;
 const QUALIFIER: usize = 13;
 const ONE_SHEET_FRONT_IMAGE: usize = 76;
 const ONE_SHEET_LAST_SENSE: usize = 96;
+const ONE_SHEET_RELEASE_REPLY: usize = 100;
 /// The height in the frame header of the recorded front image, after the two leading bytes and the comment segment.
 const FRAME_HEIGHT: usize = 28;
 
@@ -39,6 +40,7 @@ impl Report for Reports {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seen {
     Reserved,
+    Abandoned,
     Refused(Refusal),
     Page(Side, bool),
     Finished(Ending, bool),
@@ -85,6 +87,7 @@ fn seen(events: Vec<Event>) -> Option<Vec<Seen>> {
             .into_iter()
             .map(|event| match event {
                 JobEvent::Reserved => Seen::Reserved,
+                JobEvent::Abandoned { .. } => Seen::Abandoned,
                 JobEvent::Refused { refusal, .. } => Seen::Refused(refusal),
                 JobEvent::Page { side, page } => Seen::Page(side, frame_size(&page).is_ok()),
                 JobEvent::Finished { ending, detail } => Seen::Finished(ending, detail.is_some()),
@@ -112,6 +115,57 @@ fn a_recorded_stack_reports_the_reserve_each_page_and_the_end() {
         seen(events(THREE_SHEETS)),
         Some(scanned(3, Seen::Finished(Ending::Completed, false)))
     );
+}
+
+#[test]
+fn a_client_that_departs_before_reserve_or_declines_creation_gets_no_pages() {
+    struct Closed {
+        waiting_checks: u8,
+        reserved: bool,
+        reports: Vec<JobEvent>,
+    }
+
+    impl Report for Closed {
+        fn report(&mut self, event: JobEvent) {
+            self.reports.push(event);
+        }
+
+        fn client_waiting(&mut self) -> bool {
+            let remaining = self.waiting_checks;
+            self.waiting_checks = remaining.saturating_sub(1);
+            remaining > 0
+        }
+
+        fn created(&mut self, _: impl FnMut()) -> bool {
+            self.reserved = true;
+            false
+        }
+    }
+
+    let outcome = |waiting_checks, script| {
+        let mut network = FixtureNetwork::new(script)?;
+        let mut report = Closed {
+            waiting_checks,
+            reserved: false,
+            reports: Vec::new(),
+        };
+        run_job(&mut network, Ipv4Addr::BROADCAST, &mut report);
+        match report.reports.as_slice() {
+            [JobEvent::Abandoned { detail }] => Some((report.reserved, detail.is_some())),
+            _ => None,
+        }
+    };
+    let occupied = changed(ONE_SHEET, RESERVE_REPLY, RESULT, &(-4_i32).to_be_bytes());
+    assert_eq!(outcome(0, occupied.clone()), Some((false, false)));
+    assert_eq!(outcome(1, occupied), Some((false, false)));
+    assert_eq!(outcome(3, events(ONE_SHEET)), Some((true, false)));
+    let refused_release = changed(
+        ONE_SHEET,
+        ONE_SHEET_RELEASE_REPLY,
+        RESULT,
+        &(-1_i32).to_be_bytes(),
+    );
+    assert_eq!(outcome(3, refused_release), Some((true, true)));
 }
 
 #[test]
@@ -170,7 +224,7 @@ fn heights_and_detail(events: Vec<Event>) -> Option<(Vec<Option<u16>>, Option<St
                 heights.push(frame_size(&page).ok().map(|frame| frame.height));
             }
             JobEvent::Finished { detail, .. } => ending = detail,
-            JobEvent::Reserved | JobEvent::Refused { .. } => {}
+            JobEvent::Reserved | JobEvent::Refused { .. } | JobEvent::Abandoned { .. } => {}
         }
     }
     Some((heights, ending))
