@@ -37,9 +37,11 @@ The bridge holds that request until a page arrives, the job ends, the client dis
 A matching `DELETE` ends the pending request with 404.
 A newer `NextDocument` request ends the older one with 503 `Superseded`.
 The bridge counts a page after the socket accepts the whole response and offers the same page again after a failed write.
-The bridge keeps an unacknowledged drained job fault for up to 60 seconds.
+The next page request waits for any preceding page write to finish.
+The bridge accepts new reads of an unacknowledged drained job fault for up to 60 seconds.
 The first complete fault response starts a ten-second feeder hint interval.
 A no-paper response updates the feeder hint after the socket accepts the whole response.
+A status request waits for a pending no-paper response to finish.
 
 On 2026-11-18 Image Capture sent `Content-Type: text/xml` and saved both sides of an A4 sheet as images of 2592 by 3648 pixels.
 The bridge accepts `text/xml` and `application/xml` for job requests, following the media types in [RFC 7303](https://www.rfc-editor.org/rfc/rfc7303#section-9).

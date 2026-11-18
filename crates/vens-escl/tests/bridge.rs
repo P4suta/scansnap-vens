@@ -77,7 +77,11 @@ fn feed<const N: usize>(
                                 observation,
                             } => {
                                 let (bridge, _) = bridge.handle(
-                                    Input::Observed { id, observation },
+                                    Input::ObservationWritten {
+                                        id,
+                                        observation,
+                                        success: true,
+                                    },
                                     Moment::from_millis(millis),
                                 );
                                 replies.push(Effect::Reply {
@@ -708,9 +712,10 @@ fn a_no_paper_hint_requires_a_written_response() {
         };
         let before = status_of(&refused, 3)?.adf;
         let (observed, _) = refused.handle(
-            Input::Observed {
+            Input::ObservationWritten {
                 id,
                 observation: Observation::NoPaper,
+                success: true,
             },
             Moment::from_millis(4),
         );
@@ -720,6 +725,49 @@ fn a_no_paper_hint_requires_a_written_response() {
         states.map(|(before, after)| (before != AdfState::Empty, after)),
         Some((true, AdfState::Empty))
     );
+}
+
+#[test]
+fn a_fault_in_flight_can_complete_after_its_read_deadline() {
+    let states = started::<4>(duplex()).map(|(bridge, id)| {
+        let observation = Observation::Fault(Fault::Jam);
+        let deadline = RETENTION_MILLIS.saturating_add(2);
+        let next = request(Request::NextDocument(id), "client");
+        let (ended, _) = bridge.handle(
+            Input::Finished(Ending::Failed(Fault::Jam)),
+            Moment::from_millis(2),
+        );
+        let (writing, pending) = ended.handle(
+            next.clone(),
+            Moment::from_millis(deadline.saturating_sub(1)),
+        );
+        assert_eq!(
+            pending.into_iter().next(),
+            Some(Effect::Observation {
+                responder: "client",
+                id,
+                observation
+            })
+        );
+        let (expired, late) = writing.handle(next, Moment::from_millis(deadline));
+        assert_eq!(
+            late.into_iter().collect::<Effects>(),
+            reply("client", Response::NotFound)
+        );
+        [true, false].map(|success| {
+            let (settled, _) = expired.clone().handle(
+                Input::ObservationWritten {
+                    id,
+                    observation,
+                    success,
+                },
+                Moment::from_millis(deadline.saturating_add(1)),
+            );
+            status_of(&settled, deadline.saturating_add(2))
+                .map(|status| status.adf == AdfState::Jam)
+        })
+    });
+    assert_eq!(states, Some([Some(true), Some(false)]));
 }
 
 #[test]

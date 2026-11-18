@@ -16,7 +16,7 @@ use vens_net::{
 
 use crate::{
     capture::Pdf,
-    job::{JobEvent, Report, run_reserved},
+    job::{CREATION_HEADROOM_MILLIS, JobEvent, Report, run_reserved},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -83,7 +83,7 @@ fn await_work<T: Report>(
         match jobs.recv_timeout(POLL_INTERVAL) {
             Ok(mut report) => {
                 if report.client_waiting() {
-                    return if scanner.renew() {
+                    return if scanner.renew_for(CREATION_HEADROOM_MILLIS) {
                         Work::Escl(report)
                     } else {
                         Work::Reconnect(Some(report))

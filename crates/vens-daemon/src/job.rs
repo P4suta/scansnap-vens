@@ -17,6 +17,9 @@ use vens_net::{
     session::{JobFailure, PrepareError},
 };
 
+/// Gives the handoff enough time for a keepalive retry round.
+pub(crate) const CREATION_HEADROOM_MILLIS: u64 = 2_000;
+
 /// What the job thread tells the owner, in order: a refusal, or the reserve, each page, and the end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobEvent {
@@ -46,7 +49,7 @@ pub trait Report {
         true
     }
 
-    fn created(&mut self) -> bool {
+    fn created(&mut self, _: impl FnMut()) -> bool {
         self.report(JobEvent::Reserved);
         true
     }
@@ -169,6 +172,9 @@ where
     if !report.client_waiting() {
         return abandon_reserved(scanner, report);
     }
+    if !scanner.renew_for(CREATION_HEADROOM_MILLIS) {
+        return refuse_expiring(scanner, report);
+    }
     match scanner.prepare().map(|prepared| prepared.paper()) {
         Ok(PaperPath::TopChute) => scan_reserved(scanner, report),
         Ok(paper @ (PaperPath::FrontSlot | PaperPath::Absent)) => {
@@ -180,6 +186,20 @@ where
             refuse(report, Refusal::Unreachable, &(failure, release));
         }
     }
+}
+
+fn refuse_expiring<N, T>(scanner: ReservedScanner<N>, report: &mut T)
+where
+    N: Network,
+    N::Error: Debug,
+    T: Report,
+{
+    let release = scanner.release();
+    refuse(
+        report,
+        Refusal::Busy,
+        &("reservation expires before job creation", release),
+    );
 }
 
 fn abandon_reserved<N, T>(reserved: ReservedScanner<N>, report: &mut T)
@@ -195,14 +215,31 @@ where
     report.report(JobEvent::Abandoned { detail });
 }
 
-fn scan_reserved<N, T>(reserved: ReservedScanner<N>, report: &mut T)
+fn scan_reserved<N, T>(mut reserved: ReservedScanner<N>, report: &mut T)
 where
     N: Network,
     N::Error: Debug,
     T: Report,
 {
-    if !report.client_waiting() || !report.created() {
+    if !report.client_waiting() {
         return abandon_reserved(reserved, report);
+    }
+    if !reserved.renew_for(CREATION_HEADROOM_MILLIS) {
+        return refuse_expiring(reserved, report);
+    }
+    if !report.created(|| {
+        let _ = reserved.renew_for(0);
+    }) {
+        return abandon_reserved(reserved, report);
+    }
+    if !reserved.renew_for(0) {
+        let release = reserved.release();
+        return report.report(JobEvent::Finished {
+            ending: Ending::Failed(Fault::Scanner),
+            detail: Some(format!(
+                "reservation expired during job creation; release: {release:?}"
+            )),
+        });
     }
     let run = reserved.scan(&mut Pages {
         report: &mut *report,

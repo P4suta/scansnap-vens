@@ -271,9 +271,10 @@ impl<N: Network> Connected<N> {
         mut self,
         prepared: Prepared,
     ) -> Result<ReservedScanner<N>, ControlError<N::Error>> {
+        let requested = self.clock.now();
         let reserved = reserve(&mut self.control, self.host, prepared)?;
         Ok(ReservedScanner {
-            liveness: ReservationLiveness::new(self.clock.now()),
+            liveness: ReservationLiveness::new(requested, self.clock.now()),
             connected: self,
             reserved,
         })
@@ -292,6 +293,16 @@ impl<N: Network> ReservedScanner<N> {
     #[must_use]
     pub const fn scanner_mac(&self) -> MacAddress {
         self.connected.scanner_mac
+    }
+
+    /// Processes timely keepalive answers and checks that the reservation still has the requested time left.
+    pub fn renew_for(&mut self, minimum_millis: u64) -> bool {
+        let now = self.connected.clock.now();
+        self.liveness.refresh(now, || {
+            let replies = self.connected.keepalive.replies();
+            self.connected.keepalive.tick(now);
+            self.connected.keepalive.replies() != replies
+        }) && self.liveness.remaining(now) >= minimum_millis
     }
 
     /// Reads the paper position after the scanner has spent time waiting.
@@ -356,11 +367,16 @@ struct ReservationLiveness {
 }
 
 impl ReservationLiveness {
-    const fn new(now: Elapsed) -> Self {
+    const fn new(requested: Elapsed, confirmed: Elapsed) -> Self {
         Self {
-            last_poll: now,
-            last_answer: now,
+            last_poll: confirmed,
+            last_answer: requested,
         }
+    }
+
+    const fn remaining(&self, now: Elapsed) -> u64 {
+        RESERVE_TIMEOUT_MILLIS
+            .saturating_sub(now.millis().saturating_sub(self.last_answer.millis()))
     }
 
     const fn expired_since(now: Elapsed, earlier: Elapsed) -> bool {
@@ -382,23 +398,13 @@ impl ReservationLiveness {
 }
 
 impl ReservedScanner<SystemNetwork> {
-    /// Checks the reservation after processing any timely keepalive answers.
-    pub fn renew(&mut self) -> bool {
-        let now = self.connected.clock.now();
-        self.liveness.refresh(now, || {
-            let replies = self.connected.keepalive.replies();
-            self.connected.keepalive.tick(now);
-            self.connected.keepalive.replies() != replies
-        })
-    }
-
     /// Keeps the reservation alive and reads a bounded number of pending button datagrams.
     ///
     /// # Errors
     ///
     /// Returns a trigger socket error that prevents listening.
     pub fn poll_trigger(&mut self, recent: &mut RecentPresses) -> io::Result<Trigger> {
-        if !self.renew() {
+        if !self.renew_for(0) {
             return Ok(Trigger::ReserveExpired);
         }
         let mut buffer = [0; PACKET_LENGTH.saturating_add(1)];
@@ -468,7 +474,8 @@ mod liveness_tests {
 
     #[test]
     fn a_queued_answer_can_renew_a_frequently_polled_reservation() {
-        let mut reserve = ReservationLiveness::new(Elapsed::from_millis(0));
+        let now = Elapsed::from_millis(0);
+        let mut reserve = ReservationLiveness::new(now, now);
         assert!(reserve.refresh(
             Elapsed::from_millis(RESERVE_TIMEOUT_MILLIS.saturating_sub(1)),
             || false
@@ -478,7 +485,8 @@ mod liveness_tests {
 
     #[test]
     fn an_expired_reservation_never_consumes_an_answer_to_renew_itself() {
-        let mut reserve = ReservationLiveness::new(Elapsed::from_millis(0));
+        let now = Elapsed::from_millis(0);
+        let mut reserve = ReservationLiveness::new(now, now);
         let mut consumed = false;
         let mut answer = || {
             consumed = true;
@@ -490,5 +498,13 @@ mod liveness_tests {
             answer
         ));
         assert!(!consumed);
+    }
+
+    #[test]
+    fn a_delayed_reserve_reply_does_not_restart_the_reservation_clock() {
+        let mut reserve =
+            ReservationLiveness::new(Elapsed::from_millis(0), Elapsed::from_millis(20_000));
+        assert_eq!(reserve.remaining(Elapsed::from_millis(20_000)), 10_000);
+        assert!(!reserve.refresh(Elapsed::from_millis(RESERVE_TIMEOUT_MILLIS), || false));
     }
 }

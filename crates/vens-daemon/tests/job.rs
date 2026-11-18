@@ -136,7 +136,7 @@ fn a_client_that_departs_before_reserve_or_declines_creation_gets_no_pages() {
             remaining > 0
         }
 
-        fn created(&mut self) -> bool {
+        fn created(&mut self, _: impl FnMut()) -> bool {
             self.reserved = true;
             false
         }

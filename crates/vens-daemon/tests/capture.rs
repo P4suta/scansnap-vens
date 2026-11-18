@@ -16,11 +16,30 @@ fn after_bytes<'a>(bytes: &'a [u8], marker: &[u8]) -> Option<&'a [u8]> {
     bytes.get(start.saturating_add(marker.len())..)
 }
 
+fn marked_fixture() -> Option<Vec<trace::Event>> {
+    let mut events = trace::parse(STACK).ok()?;
+    let marker = [0xff, 0xd8, 0xff, 0xfe, 0x00, 0x11];
+    let mut sides = 0_u8;
+    for event in &mut events {
+        if let Some(start) = event
+            .bytes
+            .windows(marker.len())
+            .position(|part| part == marker)
+        {
+            let comment = event.bytes.get_mut(start.saturating_add(marker.len()))?;
+            *comment = b'A'.saturating_add(sides);
+            sides = sides.saturating_add(1);
+        }
+    }
+    (sides == 6).then_some(events)
+}
+
 #[test]
 fn a_recorded_stack_publishes_one_pdf_with_six_embedded_jpegs() {
     let result = (|| {
         let output = tempfile::tempdir().ok()?;
-        let mut network = FixtureNetwork::new(trace::parse(STACK).ok()?)?;
+        let frames = marked_fixture()?;
+        let mut network = FixtureNetwork::new(frames.clone())?;
         let mut pdf = Pdf::default();
         operation::scan(&mut network, std::net::Ipv4Addr::BROADCAST, &mut pdf)
             .outcome
@@ -38,7 +57,7 @@ fn a_recorded_stack_publishes_one_pdf_with_six_embedded_jpegs() {
         let ordered_pages = page_tree.contains("/Kids [3 0 R 6 0 R 9 0 R 12 0 R 15 0 R 18 0 R]")
             && page_tree.contains("/Count 6");
         let reference = tempfile::tempdir().ok()?;
-        let mut fixture = FixtureNetwork::new(trace::parse(STACK).ok()?)?;
+        let mut fixture = FixtureNetwork::new(frames)?;
         let mut images_on_disk = DirectorySink::new(reference.path().to_path_buf());
         operation::scan(
             &mut fixture,

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     convert::Infallible,
     fmt::Debug,
     io::{self, Read, Write},
@@ -116,8 +117,15 @@ impl Reply {
                 id,
                 observation,
                 events,
-            } if success => Some((events, Event::Observed { id, observation })),
-            Acknowledge::None | Acknowledge::Observation { .. } => None,
+            } => Some((
+                events,
+                Event::ObservationWritten {
+                    id,
+                    observation,
+                    success,
+                },
+            )),
+            Acknowledge::None => None,
         }
     }
 
@@ -145,11 +153,97 @@ enum Event {
         id: Uuid,
         returned: Option<Vec<u8>>,
     },
-    Observed {
+    ObservationWritten {
         id: Uuid,
         observation: Observation,
+        success: bool,
     },
     Line(String, Option<ConnectionSlot>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingWrite {
+    Page(Uuid),
+    NoPaper(Uuid),
+}
+
+#[derive(Default)]
+struct PendingReplies {
+    writes: Vec<PendingWrite>,
+    requests: VecDeque<Event>,
+}
+
+impl PendingReplies {
+    fn track(&mut self, ack: &Acknowledge) {
+        let write = match *ack {
+            Acknowledge::Page { id, .. } => PendingWrite::Page(id),
+            Acknowledge::Observation {
+                id,
+                observation: Observation::NoPaper,
+                ..
+            } => PendingWrite::NoPaper(id),
+            Acknowledge::None
+            | Acknowledge::Observation {
+                observation: Observation::Fault(_),
+                ..
+            } => return,
+        };
+        self.writes.push(write);
+    }
+
+    fn finish(&mut self, event: &Event) {
+        let write = match *event {
+            Event::Transfer { id, .. }
+            | Event::Request {
+                request: Request::DeleteJob(id),
+                ..
+            } => PendingWrite::Page(id),
+            Event::ObservationWritten {
+                id,
+                observation: Observation::NoPaper,
+                ..
+            } => PendingWrite::NoPaper(id),
+            Event::Request { .. }
+            | Event::Job(_)
+            | Event::ObservationWritten {
+                observation: Observation::Fault(_),
+                ..
+            }
+            | Event::Line(..) => return,
+        };
+        self.writes.retain(|&pending| pending != write);
+    }
+
+    fn waits(&self, event: &Event) -> bool {
+        let Event::Request { request, .. } = event else {
+            return false;
+        };
+        match request {
+            Request::Status => self
+                .writes
+                .iter()
+                .any(|write| matches!(write, PendingWrite::NoPaper(_))),
+            Request::NextDocument(id) => self.writes.contains(&PendingWrite::Page(*id)),
+            Request::Capabilities
+            | Request::CreateJob(_)
+            | Request::DeleteJob(_)
+            | Request::Unrouted(_)
+            | Request::Malformed => false,
+        }
+    }
+
+    fn next(&mut self, inbox: &Receiver<Event>) -> Option<Event> {
+        if let Some(ready) = self.requests.iter().position(|event| !self.waits(event)) {
+            return self.requests.remove(ready);
+        }
+        while let Ok(event) = inbox.recv() {
+            if !self.waits(&event) {
+                return Some(event);
+            }
+            self.requests.push_back(event);
+        }
+        None
+    }
 }
 
 struct ToOwner {
@@ -166,8 +260,17 @@ impl Report for ToOwner {
         self.created.try_recv() == Err(TryRecvError::Empty)
     }
 
-    fn created(&mut self) -> bool {
-        self.events.send(Event::Job(JobEvent::Reserved)).is_ok() && self.created.recv().is_ok()
+    fn created(&mut self, mut while_waiting: impl FnMut()) -> bool {
+        if self.events.send(Event::Job(JobEvent::Reserved)).is_err() {
+            return false;
+        }
+        loop {
+            match self.created.recv_timeout(PEER_POLL) {
+                Ok(()) => return true,
+                Err(RecvTimeoutError::Timeout) => while_waiting(),
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
     }
 }
 
@@ -491,7 +594,15 @@ fn to_input<L: Log>(event: Event, log: &mut L) -> Option<OwnerInput> {
             Input::Page { side, page }
         }
         Event::Transfer { id, returned } => Input::PageWritten { id, returned },
-        Event::Observed { id, observation } => Input::Observed { id, observation },
+        Event::ObservationWritten {
+            id,
+            observation,
+            success,
+        } => Input::ObservationWritten {
+            id,
+            observation,
+            success,
+        },
         Event::Job(JobEvent::Finished { ending, detail }) => {
             let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
             log.record(&format!("job finished: {ending:?}{detail}"));
@@ -506,9 +617,15 @@ fn to_input<L: Log>(event: Event, log: &mut L) -> Option<OwnerInput> {
     Some(input)
 }
 
-fn respond<L: Log>(responder: &Responder, reply: Reply, log: &mut L) -> Option<Event> {
+fn respond<L: Log>(
+    responder: &Responder,
+    reply: Reply,
+    pending: &mut PendingReplies,
+    log: &mut L,
+) -> Option<Event> {
     let (code, _) = status(&reply.response);
     let reason = reason(&reply.response);
+    pending.track(&reply.acknowledge);
     if let Err(mut undelivered) = responder.reply.send(reply) {
         log.record(&format!("{} response receiver closed", responder.line));
         return undelivered.0.completion(false).map(|(_, event)| event);
@@ -535,7 +652,9 @@ fn own<'scope, S: Networks, L: Log>(
 ) {
     let epoch = Instant::now();
     let mut bridge = Bridge::<Responder, Vec<u8>, QUEUE>::new(config.uuid, config.seed);
-    while let Ok(event) = inbox.recv() {
+    let mut pending = PendingReplies::default();
+    while let Some(event) = pending.next(inbox) {
+        pending.finish(&event);
         let Some(mut input) = to_input(event, log) else {
             continue;
         };
@@ -557,6 +676,7 @@ fn own<'scope, S: Networks, L: Log>(
                         response,
                         acknowledge: Acknowledge::None,
                     },
+                    &mut pending,
                     log,
                 ),
                 Effect::Transfer {
@@ -572,6 +692,7 @@ fn own<'scope, S: Networks, L: Log>(
                             events: events.clone(),
                         },
                     },
+                    &mut pending,
                     log,
                 ),
                 Effect::Observation {
@@ -588,6 +709,7 @@ fn own<'scope, S: Networks, L: Log>(
                             events: events.clone(),
                         },
                     },
+                    &mut pending,
                     log,
                 ),
                 Effect::Start(_) => {
@@ -612,10 +734,11 @@ fn own<'scope, S: Networks, L: Log>(
                     None
                 }
             };
-            if let Some(event) = follow_up
-                && let Some(input) = to_input(event, log)
-            {
-                (bridge, _) = bridge.handle(input, now(epoch));
+            if let Some(event) = follow_up {
+                pending.finish(&event);
+                if let Some(input) = to_input(event, log) {
+                    (bridge, _) = bridge.handle(input, now(epoch));
+                }
             }
         }
     }
@@ -690,8 +813,9 @@ mod tests {
     use std::net::Shutdown;
 
     use super::{
-        Acknowledge, Duration, Event, Ipv4Addr, Log, Reply, Responder, Response, TcpListener,
-        TcpStream, TryRecvError, Uuid, mpsc, peer_waiting, respond,
+        Acknowledge, Duration, Event, Ipv4Addr, Log, Observation, PendingReplies, PendingWrite,
+        Reply, Request, Responder, Response, TcpListener, TcpStream, TryRecvError, Uuid, mpsc,
+        peer_waiting, respond,
     };
 
     struct Ignore;
@@ -717,6 +841,7 @@ mod tests {
                 response: Response::Page([1, 2].to_vec()),
                 acknowledge: Acknowledge::Page { id, events },
             },
+            &mut PendingReplies::default(),
             &mut Ignore,
         );
         assert!(
@@ -737,5 +862,68 @@ mod tests {
             Some((eof, peer_waiting(&stream)))
         })();
         assert_eq!(observed, Some((0, true)));
+    }
+
+    #[test]
+    fn dependent_requests_wait_for_writes_without_delaying_other_requests() {
+        let id = Uuid::from_bytes([3; 16]);
+        let (traffic, inbox) = mpsc::channel();
+        let request = |request| Event::Request {
+            request,
+            responder: Responder {
+                line: String::new(),
+                job: None,
+                reply: mpsc::channel().0,
+                starter: None,
+            },
+            slot: mpsc::channel().0,
+        };
+        let mut pending = PendingReplies::default();
+        pending
+            .writes
+            .extend([PendingWrite::Page(id), PendingWrite::NoPaper(id)]);
+        for event in [
+            request(Request::NextDocument(id)),
+            request(Request::Status),
+            request(Request::Capabilities),
+            Event::Transfer { id, returned: None },
+            Event::ObservationWritten {
+                id,
+                observation: Observation::NoPaper,
+                success: false,
+            },
+        ] {
+            assert!(traffic.send(event).is_ok());
+        }
+        drop(traffic);
+        assert!(matches!(
+            pending.next(&inbox),
+            Some(Event::Request {
+                request: Request::Capabilities,
+                ..
+            })
+        ));
+        assert!(matches!(pending.next(&inbox), Some(Event::Transfer { .. })));
+        pending.finish(&Event::Transfer { id, returned: None });
+        assert!(
+            matches!(pending.next(&inbox), Some(Event::Request {request: Request::NextDocument(next), ..}) if next == id)
+        );
+        let result = Event::ObservationWritten {
+            id,
+            observation: Observation::NoPaper,
+            success: false,
+        };
+        assert!(matches!(
+            pending.next(&inbox),
+            Some(Event::ObservationWritten { .. })
+        ));
+        pending.finish(&result);
+        assert!(matches!(
+            pending.next(&inbox),
+            Some(Event::Request {
+                request: Request::Status,
+                ..
+            })
+        ));
     }
 }
