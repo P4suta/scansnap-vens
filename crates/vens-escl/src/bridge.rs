@@ -81,7 +81,7 @@ pub enum Input<R, P> {
     Refused(Refusal),
     Page { side: Side, page: P },
     PageWritten { id: Uuid, returned: Option<P> },
-    FaultWritten(Uuid),
+    Observed { id: Uuid, observation: Observation },
     Finished(Ending),
 }
 
@@ -91,6 +91,22 @@ pub enum Conflict {
     NoPaper,
     Unregistered,
     Failed(Fault),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observation {
+    NoPaper,
+    Fault(Fault),
+}
+
+impl Observation {
+    #[must_use]
+    pub const fn conflict(self) -> Conflict {
+        match self {
+            Self::NoPaper => Conflict::NoPaper,
+            Self::Fault(fault) => Conflict::Failed(fault),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,10 +144,10 @@ pub enum Effect<R, P> {
         id: Uuid,
         page: P,
     },
-    Fault {
+    Observation {
         responder: R,
         id: Uuid,
-        fault: Fault,
+        observation: Observation,
     },
     /// Starts the job thread, which reports the reserve, each page, and the end.
     Start(JobSettings),
@@ -168,10 +184,10 @@ impl<R, P> Effects<R, P> {
     const fn end(responder: R, id: Uuid, ending: Ending) -> Self {
         match ending {
             Ending::Completed => Self::reply(responder, Response::NotFound),
-            Ending::Failed(fault) => Self::one(Effect::Fault {
+            Ending::Failed(fault) => Self::one(Effect::Observation {
                 responder,
                 id,
-                fault,
+                observation: Observation::Fault(fault),
             }),
         }
     }
@@ -268,7 +284,7 @@ struct Job<R, P, const N: usize> {
     transfer: Transfer<P>,
     delivered: u32,
     lost: u32,
-    fault_observed: bool,
+    fault_until: Option<Moment>,
     touched: Moment,
 }
 
@@ -377,12 +393,14 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Input::Request { request, responder } => bridge.request(request, responder, now),
             Input::Reserved => bridge.reserved(),
             Input::Abandoned => bridge.abandoned(),
-            Input::Refused(refusal) => bridge.refused(refusal, now),
+            Input::Refused(refusal) => bridge.refused(refusal),
             Input::Page { side, page } => bridge.page(side, page),
             Input::PageWritten { id, returned } => {
                 (bridge.page_written(id, returned, now), Effects::none())
             }
-            Input::FaultWritten(id) => (bridge.fault_written(id, now), Effects::none()),
+            Input::Observed { id, observation } => {
+                (bridge.observed(id, observation, now), Effects::none())
+            }
             Input::Finished(ending) => bridge.finished(ending, now),
         }
     }
@@ -392,8 +410,10 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Activity::Idle(Some(hint)) => now >= hint.until,
             Activity::Idle(None) => false,
             Activity::Busy(job) => match job.phase {
-                Phase::Finished(Ending::Failed(_)) if !job.has_pages() && !job.fault_observed => {
-                    false
+                Phase::Finished(Ending::Failed(_)) if !job.has_pages() => {
+                    now >= job
+                        .fault_until
+                        .unwrap_or_else(|| job.touched.after(RETENTION_MILLIS))
                 }
                 Phase::Finished(_) => {
                     let stay = if matches!(job.transfer, Transfer::Writing) {
@@ -506,7 +526,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             transfer: Transfer::Idle,
             delivered: 0,
             lost: 0,
-            fault_observed: false,
+            fault_until: None,
             touched: now,
         });
         self.jobs = jobs;
@@ -534,7 +554,7 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
         (self, effects)
     }
 
-    fn refused(mut self, refusal: Refusal, now: Moment) -> (Self, Effects<R, P>) {
+    fn refused(mut self, refusal: Refusal) -> (Self, Effects<R, P>) {
         let Some(job) = self.take_job() else {
             return (self, Effects::none());
         };
@@ -542,11 +562,14 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
             Phase::Starting(responder) => {
                 let response = match refusal {
                     Refusal::NoPaper => {
-                        self.activity = Activity::Idle(Some(Hint {
-                            adf: AdfState::Empty,
-                            until: now.after(HINT_MILLIS),
-                        }));
-                        Response::Conflict(Conflict::NoPaper)
+                        return (
+                            self,
+                            Effects::one(Effect::Observation {
+                                responder,
+                                id: job.id,
+                                observation: Observation::NoPaper,
+                            }),
+                        );
                     }
                     Refusal::Unregistered => Response::Conflict(Conflict::Unregistered),
                     Refusal::Busy => Response::Unavailable(Unavailable::ScannerBusy),
@@ -632,14 +655,28 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
         self
     }
 
-    fn fault_written(mut self, id: Uuid, now: Moment) -> Self {
-        if let Activity::Busy(job) = &mut self.activity
-            && job.id == id
-            && matches!(job.phase, Phase::Finished(Ending::Failed(_)))
-            && !job.has_pages()
-        {
-            job.fault_observed = true;
-            job.touched = now;
+    fn observed(mut self, id: Uuid, observation: Observation, now: Moment) -> Self {
+        match observation {
+            Observation::NoPaper => {
+                if matches!(self.activity, Activity::Idle(None))
+                    && job_id(self.seed, self.jobs) == id
+                {
+                    self.activity = Activity::Idle(Some(Hint {
+                        adf: AdfState::Empty,
+                        until: now.after(HINT_MILLIS),
+                    }));
+                }
+            }
+            Observation::Fault(fault) => {
+                if let Activity::Busy(job) = &mut self.activity
+                    && job.id == id
+                    && matches!(job.phase, Phase::Finished(Ending::Failed(ended)) if ended == fault)
+                    && !job.has_pages()
+                    && job.fault_until.is_none()
+                {
+                    job.fault_until = Some(now.after(HINT_MILLIS));
+                }
+            }
         }
         self
     }
@@ -723,7 +760,9 @@ impl<R, P, const N: usize> Bridge<R, P, N> {
                 }
             }
             Phase::Finished(ending) => {
-                job.touched = now;
+                if page.is_some() || ending == Ending::Completed {
+                    job.touched = now;
+                }
                 let effects = match page {
                     Some(page) => Effects::transfer(responder, id, page),
                     None => Effects::end(responder, id, ending),

@@ -12,7 +12,7 @@ use std::{
 use vens_core::jpeg::{components, frame_size};
 use vens_escl::{
     bridge::{
-        Bridge, Conflict, Effect, Input, Moment, Refusal, Request, Response, Side, Unavailable,
+        Bridge, Effect, Input, Moment, Observation, Refusal, Request, Response, Side, Unavailable,
     },
     uuid::Uuid,
 };
@@ -81,8 +81,15 @@ struct Responder {
 
 enum Acknowledge {
     None,
-    Page { id: Uuid, events: Sender<Event> },
-    Fault { id: Uuid, events: Sender<Event> },
+    Page {
+        id: Uuid,
+        events: Sender<Event>,
+    },
+    Observation {
+        id: Uuid,
+        observation: Observation,
+        events: Sender<Event>,
+    },
 }
 
 struct Reply {
@@ -91,7 +98,7 @@ struct Reply {
 }
 
 impl Reply {
-    fn written(&mut self, success: bool) {
+    fn completion(&mut self, success: bool) -> Option<(Sender<Event>, Event)> {
         match std::mem::replace(&mut self.acknowledge, Acknowledge::None) {
             Acknowledge::Page { id, events } => {
                 let returned = if success {
@@ -103,12 +110,20 @@ impl Reply {
                 } else {
                     None
                 };
-                let _ = events.send(Event::Transfer { id, returned });
+                Some((events, Event::Transfer { id, returned }))
             }
-            Acknowledge::Fault { id, events } if success => {
-                let _ = events.send(Event::FaultWritten(id));
-            }
-            Acknowledge::None | Acknowledge::Fault { .. } => {}
+            Acknowledge::Observation {
+                id,
+                observation,
+                events,
+            } if success => Some((events, Event::Observed { id, observation })),
+            Acknowledge::None | Acknowledge::Observation { .. } => None,
+        }
+    }
+
+    fn written(&mut self, success: bool) {
+        if let Some((events, event)) = self.completion(success) {
+            let _ = events.send(event);
         }
     }
 }
@@ -130,7 +145,10 @@ enum Event {
         id: Uuid,
         returned: Option<Vec<u8>>,
     },
-    FaultWritten(Uuid),
+    Observed {
+        id: Uuid,
+        observation: Observation,
+    },
     Line(String, Option<ConnectionSlot>),
 }
 
@@ -445,7 +463,7 @@ fn reason<P>(response: &Response<P>) -> String {
 
 type OwnerInput = Input<Responder, Vec<u8>>;
 
-fn input<L: Log>(event: Event, log: &mut L) -> Option<OwnerInput> {
+fn to_input<L: Log>(event: Event, log: &mut L) -> Option<OwnerInput> {
     let input = match event {
         Event::Request {
             request,
@@ -473,7 +491,7 @@ fn input<L: Log>(event: Event, log: &mut L) -> Option<OwnerInput> {
             Input::Page { side, page }
         }
         Event::Transfer { id, returned } => Input::PageWritten { id, returned },
-        Event::FaultWritten(id) => Input::FaultWritten(id),
+        Event::Observed { id, observation } => Input::Observed { id, observation },
         Event::Job(JobEvent::Finished { ending, detail }) => {
             let detail = detail.map_or_else(String::new, |detail| format!(" ({detail})"));
             log.record(&format!("job finished: {ending:?}{detail}"));
@@ -488,12 +506,12 @@ fn input<L: Log>(event: Event, log: &mut L) -> Option<OwnerInput> {
     Some(input)
 }
 
-fn respond<L: Log>(responder: &Responder, reply: Reply, log: &mut L) {
+fn respond<L: Log>(responder: &Responder, reply: Reply, log: &mut L) -> Option<Event> {
     let (code, _) = status(&reply.response);
     let reason = reason(&reply.response);
-    if responder.reply.send(reply).is_err() {
+    if let Err(mut undelivered) = responder.reply.send(reply) {
         log.record(&format!("{} response receiver closed", responder.line));
-        return;
+        return undelivered.0.completion(false).map(|(_, event)| event);
     }
     let client = responder
         .job
@@ -503,6 +521,7 @@ fn respond<L: Log>(responder: &Responder, reply: Reply, log: &mut L) {
     if let (400..=599, Some(job)) = (code, &responder.job) {
         log.record(&format!("{} body {:?}", responder.line, job.body));
     }
+    None
 }
 
 fn own<'scope, S: Networks, L: Log>(
@@ -517,7 +536,7 @@ fn own<'scope, S: Networks, L: Log>(
     let epoch = Instant::now();
     let mut bridge = Bridge::<Responder, Vec<u8>, QUEUE>::new(config.uuid, config.seed);
     while let Ok(event) = inbox.recv() {
-        let Some(mut input) = input(event, log) else {
+        let Some(mut input) = to_input(event, log) else {
             continue;
         };
         let mut starter = if let Input::Request { responder, .. } = &mut input {
@@ -528,54 +547,49 @@ fn own<'scope, S: Networks, L: Log>(
         let (next, effects) = bridge.handle(input, now(epoch));
         bridge = next;
         for effect in effects {
-            match effect {
+            let follow_up = match effect {
                 Effect::Reply {
                     responder,
                     response,
-                } => {
-                    respond(
-                        &responder,
-                        Reply {
-                            response,
-                            acknowledge: Acknowledge::None,
-                        },
-                        log,
-                    );
-                }
+                } => respond(
+                    &responder,
+                    Reply {
+                        response,
+                        acknowledge: Acknowledge::None,
+                    },
+                    log,
+                ),
                 Effect::Transfer {
                     responder,
                     id,
                     page,
-                } => {
-                    respond(
-                        &responder,
-                        Reply {
-                            response: Response::Page(page),
-                            acknowledge: Acknowledge::Page {
-                                id,
-                                events: events.clone(),
-                            },
+                } => respond(
+                    &responder,
+                    Reply {
+                        response: Response::Page(page),
+                        acknowledge: Acknowledge::Page {
+                            id,
+                            events: events.clone(),
                         },
-                        log,
-                    );
-                }
-                Effect::Fault {
+                    },
+                    log,
+                ),
+                Effect::Observation {
                     responder,
                     id,
-                    fault,
-                } => {
-                    respond(
-                        &responder,
-                        Reply {
-                            response: Response::Conflict(Conflict::Failed(fault)),
-                            acknowledge: Acknowledge::Fault {
-                                id,
-                                events: events.clone(),
-                            },
+                    observation,
+                } => respond(
+                    &responder,
+                    Reply {
+                        response: Response::Conflict(observation.conflict()),
+                        acknowledge: Acknowledge::Observation {
+                            id,
+                            observation,
+                            events: events.clone(),
                         },
-                        log,
-                    );
-                }
+                    },
+                    log,
+                ),
                 Effect::Start(_) => {
                     let Some(created) = starter.take() else {
                         let _ = events.send(Event::Job(JobEvent::Abandoned { detail: None }));
@@ -595,7 +609,13 @@ fn own<'scope, S: Networks, L: Log>(
                     } else {
                         start_job(scope, networks, config.target, report);
                     }
+                    None
                 }
+            };
+            if let Some(event) = follow_up
+                && let Some(input) = to_input(event, log)
+            {
+                (bridge, _) = bridge.handle(input, now(epoch));
             }
         }
     }
@@ -663,4 +683,59 @@ pub fn serve_configured<S: Networks, L: Log>(
             &mut log,
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Shutdown;
+
+    use super::{
+        Acknowledge, Duration, Event, Ipv4Addr, Log, Reply, Responder, Response, TcpListener,
+        TcpStream, TryRecvError, Uuid, mpsc, peer_waiting, respond,
+    };
+
+    struct Ignore;
+
+    impl Log for Ignore {
+        fn record(&mut self, _: &str) {}
+    }
+
+    #[test]
+    fn a_closed_reply_receiver_returns_the_page_to_the_current_owner_turn() {
+        let (replies, receiver) = mpsc::channel();
+        drop(receiver);
+        let (events, inbox) = mpsc::channel();
+        let id = Uuid::from_bytes([3; 16]);
+        let returned = respond(
+            &Responder {
+                line: String::new(),
+                job: None,
+                reply: replies,
+                starter: None,
+            },
+            Reply {
+                response: Response::Page([1, 2].to_vec()),
+                acknowledge: Acknowledge::Page { id, events },
+            },
+            &mut Ignore,
+        );
+        assert!(
+            matches!(returned, Some(Event::Transfer { id: job, returned: Some(page) }) if job == id && page == [1, 2])
+        );
+        assert!(matches!(inbox.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn a_write_half_close_leaves_the_peer_available_for_a_reply() {
+        let observed = (|| {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+            let client = TcpStream::connect(listener.local_addr().ok()?).ok()?;
+            let (stream, _) = listener.accept().ok()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            client.shutdown(Shutdown::Write).ok()?;
+            let eof = stream.peek(&mut [0_u8; 1]).ok()?;
+            Some((eof, peer_waiting(&stream)))
+        })();
+        assert_eq!(observed, Some((0, true)));
+    }
 }

@@ -53,7 +53,7 @@ fn acquire(network: &mut SystemNetwork, target: Ipv4Addr) -> Result<Scanner, (Re
 enum Work<T> {
     Pressed,
     Escl(T),
-    Reconnect,
+    Reconnect(Option<T>),
     Stop,
 }
 
@@ -69,21 +69,25 @@ fn await_work<T: Report>(
             Ok(Trigger::Pressed) => return Work::Pressed,
             Ok(Trigger::PoweredOff) => {
                 log("the scanner is turning off");
-                return Work::Reconnect;
+                return Work::Reconnect(None);
             }
             Ok(Trigger::ReserveExpired) => {
                 log("the scanner stopped answering keepalive probes");
-                return Work::Reconnect;
+                return Work::Reconnect(None);
             }
             Err(error) => {
                 log(&format!("the button socket failed: {error}"));
-                return Work::Reconnect;
+                return Work::Reconnect(None);
             }
         }
         match jobs.recv_timeout(POLL_INTERVAL) {
             Ok(mut report) => {
                 if report.client_waiting() {
-                    return Work::Escl(report);
+                    return if scanner.renew() {
+                        Work::Escl(report)
+                    } else {
+                        Work::Reconnect(Some(report))
+                    };
                 }
                 report.report(JobEvent::Abandoned { detail: None });
             }
@@ -100,6 +104,12 @@ fn acquire_for_job<T: Report>(network: &mut SystemNetwork, target: Ipv4Addr, mut
     match acquire(network, target) {
         Ok(scanner) => run_reserved(scanner, &mut report),
         Err((refusal, detail)) => report.report(JobEvent::Refused { refusal, detail }),
+    }
+}
+
+fn release(scanner: Scanner, log: &impl Fn(&str)) {
+    if let Err(error) = scanner.release() {
+        log(&format!("release after listening failed: {error:?}"));
     }
 }
 
@@ -139,6 +149,7 @@ pub(crate) fn run<T: Report>(
     log: impl Fn(&str),
 ) {
     let mut recent = RecentPresses::default();
+    let mut selected = None;
     loop {
         let mut scanner = match acquire(&mut network, target) {
             Ok(scanner) => scanner,
@@ -152,19 +163,23 @@ pub(crate) fn run<T: Report>(
                 continue;
             }
         };
+        let device = Some(scanner.scanner_mac());
+        if selected != device {
+            recent = RecentPresses::default();
+            selected = device;
+        }
         log("waiting for the Scan button");
         match await_work(&mut scanner, &mut recent, jobs, &log) {
             Work::Pressed => save(scanner, folder, &log),
             Work::Escl(mut report) => run_reserved(scanner, &mut report),
-            work @ (Work::Reconnect | Work::Stop) => {
-                if let Err(error) = scanner.release() {
-                    log(&format!("release after listening failed: {error:?}"));
-                }
-                if matches!(work, Work::Stop) {
-                    return;
-                }
+            Work::Reconnect(job) => {
+                release(scanner, &log);
                 recent = RecentPresses::default();
+                if let Some(report) = job {
+                    acquire_for_job(&mut network, target, report);
+                }
             }
+            Work::Stop => return release(scanner, &log),
         }
     }
 }

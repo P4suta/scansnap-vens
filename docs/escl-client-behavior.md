@@ -37,8 +37,9 @@ The bridge holds that request until a page arrives, the job ends, the client dis
 A matching `DELETE` ends the pending request with 404.
 A newer `NextDocument` request ends the older one with 503 `Superseded`.
 The bridge counts a page after the socket accepts the whole response and offers the same page again after a failed write.
-The bridge keeps a drained job fault until the socket accepts the whole fault response.
-The fault then stays visible for the feeder hint interval.
+The bridge keeps an unacknowledged drained job fault for up to 60 seconds.
+The first complete fault response starts a ten-second feeder hint interval.
+A no-paper response updates the feeder hint after the socket accepts the whole response.
 
 On 2026-11-18 Image Capture sent `Content-Type: text/xml` and saved both sides of an A4 sheet as images of 2592 by 3648 pixels.
 The bridge accepts `text/xml` and `application/xml` for job requests, following the media types in [RFC 7303](https://www.rfc-editor.org/rfc/rfc7303#section-9).
@@ -49,8 +50,9 @@ The worker then resumed waiting for the Scan button.
 
 sane-airscan [sends `Connection: close`](https://github.com/alexpevzner/sane-airscan/blob/689a6c660508fa94127318df8c6d6987e3d394cc/airscan-http.c#L2253-L2270) with every request.
 The bridge closes each connection after one answer, as [RFC 9112, section 9.3](https://www.rfc-editor.org/rfc/rfc9112#section-9.3) describes.
-The bridge accepts numeric addresses, local hostnames, and `host.orb.internal` in the request authority.
-Local hostnames include the `home.arpa` domain described in [RFC 8375](https://www.rfc-editor.org/rfc/rfc8375.html#section-4).
+The bridge accepts numeric addresses, single-label names, names ending in `.local` or `.home.arpa`, and the exact names `home.arpa` and `host.orb.internal`.
+Use the bridge's IP address when its hostname falls outside those forms.
+See the definition of `home.arpa` in [RFC 8375](https://www.rfc-editor.org/rfc/rfc8375.html#section-4).
 An acceptor delegates each connection to a bounded set of workers with separate request, response wait, and write deadlines.
 sane-airscan [reads the `ty`, `uuid`, and `rs` keys](https://github.com/alexpevzner/sane-airscan/blob/689a6c660508fa94127318df8c6d6987e3d394cc/airscan-mdns.c#L586-L630) of the text record.
 The record puts `txtvers` first, as [RFC 6763, section 6.7](https://www.rfc-editor.org/rfc/rfc6763#section-6.7) recommends.

@@ -71,6 +71,7 @@ impl Clock for Frozen {
 
 struct Scripted {
     connections: Vec<(SocketAddrV4, Connection)>,
+    keepalive_scanner: Option<Ipv4Addr>,
 }
 
 impl Network for Scripted {
@@ -92,7 +93,8 @@ impl Network for Scripted {
         })
     }
 
-    fn keepalive(&mut self, discovery: Air, _: Ipv4Addr) -> Result<Air, Down> {
+    fn keepalive(&mut self, discovery: Air, scanner: Ipv4Addr) -> Result<Air, Down> {
+        self.keepalive_scanner = Some(scanner);
         Ok(Air {
             nonblocking: true,
             ..discovery
@@ -132,6 +134,7 @@ fn endpoint(port: u16) -> SocketAddrV4 {
 type Observed = (
     Result<(), Down>,
     Option<bool>,
+    Option<Ipv4Addr>,
     Vec<(SocketAddrV4, Connection)>,
     Vec<Event>,
 );
@@ -141,6 +144,7 @@ fn recorded_run() -> Observed {
     let mut network = RecordingNetwork::new(
         Scripted {
             connections: Vec::new(),
+            keepalive_scanner: None,
         },
         events,
     );
@@ -163,6 +167,7 @@ fn recorded_run() -> Observed {
     (
         outcome.map(|_| ()),
         nonblocking,
+        scripted.keepalive_scanner,
         scripted.connections,
         log.try_iter().collect(),
     )
@@ -170,12 +175,13 @@ fn recorded_run() -> Observed {
 
 #[test]
 fn a_recording_network_logs_every_transfer_with_its_channel_in_call_order() {
-    let (outcome, nonblocking, connections, events) = recorded_run();
+    let (outcome, nonblocking, keepalive_scanner, connections, events) = recorded_run();
     assert_eq!(
-        (outcome, nonblocking, connections, events),
+        (outcome, nonblocking, keepalive_scanner, connections, events),
         (
             Ok(()),
             Some(true),
+            Some(*endpoint(52217).ip()),
             [
                 (endpoint(53218), Connection::Command),
                 (endpoint(53219), Connection::Control),

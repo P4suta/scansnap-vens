@@ -198,6 +198,7 @@ pub fn status<N: Network>(
 pub struct Connected<N: Network> {
     host: Host,
     scanner: Ipv4Addr,
+    scanner_mac: MacAddress,
     command: CommandChannel<N::Stream>,
     control: ControlChannel<N::Stream>,
     clock: N::Clock,
@@ -236,6 +237,7 @@ pub fn open<N: Network>(
     );
     Ok(Connected {
         scanner: scanner_address,
+        scanner_mac: found.reply.mac(),
         host: Host {
             mac: HOST_MAC,
             address: found.local,
@@ -271,7 +273,7 @@ impl<N: Network> Connected<N> {
     ) -> Result<ReservedScanner<N>, ControlError<N::Error>> {
         let reserved = reserve(&mut self.control, self.host, prepared)?;
         Ok(ReservedScanner {
-            last_answer: self.clock.now(),
+            liveness: ReservationLiveness::new(self.clock.now()),
             connected: self,
             reserved,
         })
@@ -283,10 +285,15 @@ impl<N: Network> Connected<N> {
 pub struct ReservedScanner<N: Network> {
     connected: Connected<N>,
     reserved: Reserved,
-    last_answer: Elapsed,
+    liveness: ReservationLiveness,
 }
 
 impl<N: Network> ReservedScanner<N> {
+    #[must_use]
+    pub const fn scanner_mac(&self) -> MacAddress {
+        self.connected.scanner_mac
+    }
+
     /// Reads the paper position after the scanner has spent time waiting.
     ///
     /// # Errors
@@ -343,21 +350,56 @@ pub enum Trigger {
     ReserveExpired,
 }
 
+struct ReservationLiveness {
+    last_poll: Elapsed,
+    last_answer: Elapsed,
+}
+
+impl ReservationLiveness {
+    const fn new(now: Elapsed) -> Self {
+        Self {
+            last_poll: now,
+            last_answer: now,
+        }
+    }
+
+    const fn expired_since(now: Elapsed, earlier: Elapsed) -> bool {
+        now.millis().saturating_sub(earlier.millis()) >= RESERVE_TIMEOUT_MILLIS
+    }
+
+    fn refresh(&mut self, now: Elapsed, answered: impl FnOnce() -> bool) -> bool {
+        if Self::expired_since(now, self.last_poll)
+            || Self::expired_since(self.last_poll, self.last_answer)
+        {
+            return false;
+        }
+        self.last_poll = now;
+        if answered() {
+            self.last_answer = now;
+        }
+        !Self::expired_since(now, self.last_answer)
+    }
+}
+
 impl ReservedScanner<SystemNetwork> {
+    /// Checks the reservation after processing any timely keepalive answers.
+    pub fn renew(&mut self) -> bool {
+        let now = self.connected.clock.now();
+        self.liveness.refresh(now, || {
+            let replies = self.connected.keepalive.replies();
+            self.connected.keepalive.tick(now);
+            self.connected.keepalive.replies() != replies
+        })
+    }
+
     /// Keeps the reservation alive and reads a bounded number of pending button datagrams.
     ///
     /// # Errors
     ///
     /// Returns a trigger socket error that prevents listening.
     pub fn poll_trigger(&mut self, recent: &mut RecentPresses) -> io::Result<Trigger> {
-        let now = self.connected.clock.now();
-        if now.millis().saturating_sub(self.last_answer.millis()) >= RESERVE_TIMEOUT_MILLIS {
+        if !self.renew() {
             return Ok(Trigger::ReserveExpired);
-        }
-        let replies = self.connected.keepalive.replies();
-        self.connected.keepalive.tick(now);
-        if self.connected.keepalive.replies() != replies {
-            self.last_answer = now;
         }
         let mut buffer = [0; PACKET_LENGTH.saturating_add(1)];
         for _ in 0..TRIGGERS_PER_POLL {
@@ -417,5 +459,36 @@ pub fn scan<N: Network, K: PageSink>(
             outcome: Err(failure),
             keepalive_failure: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::{Elapsed, RESERVE_TIMEOUT_MILLIS, ReservationLiveness};
+
+    #[test]
+    fn a_queued_answer_can_renew_a_frequently_polled_reservation() {
+        let mut reserve = ReservationLiveness::new(Elapsed::from_millis(0));
+        assert!(reserve.refresh(
+            Elapsed::from_millis(RESERVE_TIMEOUT_MILLIS.saturating_sub(1)),
+            || false
+        ));
+        assert!(reserve.refresh(Elapsed::from_millis(RESERVE_TIMEOUT_MILLIS), || true));
+    }
+
+    #[test]
+    fn an_expired_reservation_never_consumes_an_answer_to_renew_itself() {
+        let mut reserve = ReservationLiveness::new(Elapsed::from_millis(0));
+        let mut consumed = false;
+        let mut answer = || {
+            consumed = true;
+            true
+        };
+        assert!(!reserve.refresh(Elapsed::from_millis(RESERVE_TIMEOUT_MILLIS), &mut answer));
+        assert!(!reserve.refresh(
+            Elapsed::from_millis(RESERVE_TIMEOUT_MILLIS.saturating_add(1)),
+            answer
+        ));
+        assert!(!consumed);
     }
 }
