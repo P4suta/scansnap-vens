@@ -5,6 +5,7 @@ members = [
   "crates/vens-daemon",
   "crates/vens-escl",
   "crates/vens-net",
+  "crates/windows-dns-sd",
   "fixtures/emulator",
   "verification/lint-fixtures",
   "xtask",

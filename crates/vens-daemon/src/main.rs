@@ -71,11 +71,30 @@ fn timestamp() -> String {
     })
 }
 
-struct Stderr;
+#[derive(Default)]
+struct Stderr {
+    failed: bool,
+}
 
 impl Log for Stderr {
     fn record(&mut self, line: &str) {
-        let _ = writeln!(io::stderr().lock(), "{} vensd: {line}", timestamp());
+        if !self.failed {
+            self.failed = writeln!(io::stderr().lock(), "{} vensd: {line}", timestamp()).is_err();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn register_dns_sd(port: u16, uuid: Uuid, log: &mut Stderr) {
+    let worker = std::thread::Builder::new().name("dns-sd".to_owned());
+    if let Err(error) = worker.spawn(move || {
+        let mut output = Stderr::default();
+        match vens_daemon::advertise::register_with_windows(port, uuid) {
+            Ok(()) => output.record("registered eSCL with the Windows responder"),
+            Err(error) => output.record(&format!("can't register eSCL discovery: {error}")),
+        }
+    }) {
+        log.record(&format!("can't start eSCL discovery: {error}"));
     }
 }
 
@@ -94,7 +113,7 @@ fn bind(port: u16) -> io::Result<Vec<TcpListener>> {
 }
 
 fn serve(port: u16, target: Ipv4Addr, uuid: Uuid, folder: Option<PathBuf>) -> ExitCode {
-    let mut log = Stderr;
+    let mut log = Stderr::default();
     let capture = if let Some(folder) = folder {
         if let Err(error) = tempfile::tempfile_in(&folder) {
             log.record(&format!("can't write to {}: {error}", folder.display()));
@@ -126,6 +145,8 @@ fn serve(port: u16, target: Ipv4Addr, uuid: Uuid, folder: Option<PathBuf>) -> Ex
     log.record(&format!(
         "listening on {local} as {uuid}, scanner at {target}"
     ));
+    #[cfg(windows)]
+    register_dns_sd(port, uuid, &mut log);
     let config = Config {
         uuid,
         seed: seed(),
@@ -160,9 +181,9 @@ fn main() -> ExitCode {
         }) => serve(port, target, uuid, Some(folder)),
         Ok(Invocation::AvahiService { port, uuid }) => print(&avahi_service(port, uuid)),
         Ok(Invocation::Help) => print(USAGE),
-        Err(error) => {
-            let _ = write!(io::stderr().lock(), "vensd: {error}\n{USAGE}");
-            ExitCode::from(USAGE_FAILURE)
-        }
+        Err(error) => match write!(io::stderr().lock(), "vensd: {error}\n{USAGE}") {
+            Ok(()) => ExitCode::from(USAGE_FAILURE),
+            Err(_) => ExitCode::FAILURE,
+        },
     }
 }
