@@ -2,7 +2,7 @@
 release = false
 release_always = false
 git_only = true
-git_tag_name = "v{{ version }}"
+git_tag_name = "{{ package }}-v{{ version }}"
 git_tag_enable = false
 git_release_enable = false
 publish = false
@@ -15,14 +15,17 @@ changelog_update = false
 [[package]]
 name = "vens-cli"
 release = true
+git_tag_name = "v{{ version }}"
 
 [[package]]
 name = "vens-core"
 release = true
+git_tag_name = "v{{ version }}"
 
 [[package]]
 name = "vens-daemon"
 release = true
+git_tag_name = "v{{ version }}"
 changelog_update = true
 changelog_path = "./CHANGELOG.md"
 changelog_include = ["vens-cli", "vens-core", "vens-escl", "vens-net"]
@@ -30,10 +33,12 @@ changelog_include = ["vens-cli", "vens-core", "vens-escl", "vens-net"]
 [[package]]
 name = "vens-escl"
 release = true
+git_tag_name = "v{{ version }}"
 
 [[package]]
 name = "vens-net"
 release = true
+git_tag_name = "v{{ version }}"
 
 [changelog]
 protect_breaking_commits = true
