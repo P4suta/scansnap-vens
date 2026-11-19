@@ -14,7 +14,7 @@ exclude = ["verification/static-types", "verification/type-fixtures"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT OR Apache-2.0"
@@ -24,10 +24,10 @@ httparse = "1.10.1"
 pdf-writer = "0.15.0"
 roxmltree = "0.21.2"
 tempfile = "3.27.0"
-vens-core = { path = "crates/vens-core", version = "0.1.0" }
+vens-core = { path = "crates/vens-core", version = "0.1.1" }
 vens-emulator = { path = "fixtures/emulator", version = "0.0.0" }
-vens-escl = { path = "crates/vens-escl", version = "0.1.0" }
-vens-net = { path = "crates/vens-net", version = "0.1.0" }
+vens-escl = { path = "crates/vens-escl", version = "0.1.1" }
+vens-net = { path = "crates/vens-net", version = "0.1.1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
