@@ -1,4 +1,11 @@
 # Changelog
+## [0.1.1](https://github.com/P4suta/scansnap-vens/compare/v0.1.0...v0.1.1) - 2026-11-19
+
+### Added
+
+Support Windows scanner discovery and distribution ([#10](https://github.com/P4suta/scansnap-vens/pull/10)).
+Automate version proposals and binary builds ([#7](https://github.com/P4suta/scansnap-vens/pull/7)).
+
 
 ## [0.1.0](https://github.com/P4suta/scansnap-vens/releases/tag/v0.1.0) - 2026-11-18
 
