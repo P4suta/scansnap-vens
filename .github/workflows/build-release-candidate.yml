@@ -116,7 +116,9 @@ jobs:
           test -s "$work/avahi.service"
       - name: Build, archive, and exercise the Windows commands
         if: matrix.platform == 'windows-x86_64' && steps.source.outputs.supported == 'true'
-        shell: pwsh
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        shell: powershell
         run: |
           $work = 'target/release-candidate'
           $bundle = "scansnap-vens-${env:VERSION}-${env:PLATFORM}"
@@ -131,18 +133,39 @@ jobs:
           Expand-Archive -LiteralPath $archive -DestinationPath "$work/extracted"
           $installed = "$work/extracted/$bundle"
           if ((Get-Content -LiteralPath "$installed/SOURCE_COMMIT") -cne $env:SOURCE_SHA) { throw 'Source commit mismatch.' }
-          & "$installed/vens.exe" --help
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$installed/vensd.exe" --help
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or !$visualStudio) { throw 'Visual C++ tools are unavailable.' }
+          $toolset = (Get-Content -LiteralPath "$visualStudio/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt" -Raw).Trim()
+          $dumpbin = "$visualStudio/VC/Tools/MSVC/$toolset/bin/Hostx64/x64/dumpbin.exe"
+          $payloads = @()
+          foreach ($command in 'vens.exe', 'vensd.exe') {
+            $executable = (Resolve-Path -LiteralPath "$installed/$command").Path
+            $image = & $dumpbin /nologo /headers /dependents $executable
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if (-not ($image -match '^\s*8664\s+machine\b')) { throw "$command is not an x64 executable." }
+            if ($image -match '^\s*(vcruntime|msvcp|msvcr|concrt|vcomp)\d+\S*\.dll\s*$') { throw "$command requires a Visual C++ Redistributable." }
+            & $executable --help
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $digest = (Get-AppLockerFileInformation -Path $executable).Hash
+            if ($digest.HashType -ne 'SHA256' -or $digest.HashDataString -notmatch '^0x[0-9a-fA-F]{64}$') { throw "Can't hash the signed content of $command." }
+            $payloads += "$($digest.HashDataString.Substring(2).ToLowerInvariant())  $command"
+          }
           $env:VENSD_UNDER_TEST = (Resolve-Path -LiteralPath "$installed/vensd.exe").Path
           mise x -- cargo test --locked -p vens-daemon --test windows_discovery
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          $record = "$bundle.authenticode-sha256"
+          $header = @("SOURCE_COMMIT $env:SOURCE_SHA", "UNSIGNED_ZIP_SHA256 $archiveHash")
+          Set-Content -LiteralPath "$work/assets/$record" -Value ((($header + $payloads) -join "`n") + "`n") -Encoding ascii -NoNewline
+          $recordHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "$work/assets/$record").Hash.ToLowerInvariant()
           $sums = "$work/assets/SHA256SUMS.${env:PLATFORM}"
-          Set-Content -LiteralPath $sums -Value "$hash  $bundle.zip" -Encoding ascii
-          $verified = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
-          if ((Get-Content -LiteralPath $sums) -cne "$verified  $bundle.zip") { throw 'Archive hash mismatch.' }
+          Set-Content -LiteralPath $sums -Value "$archiveHash  $bundle.zip`n$recordHash  $record`n" -Encoding ascii -NoNewline
+          $verified = foreach ($asset in "$bundle.zip", $record) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "$work/assets/$asset").Hash.ToLowerInvariant()
+            "$hash  $asset"
+          }
+          if ((Get-Content -LiteralPath $sums -Raw) -cne (($verified -join "`n") + "`n")) { throw 'Artifact hash mismatch.' }
       - name: Archive the source and its locked dependency inventory
         if: matrix.platform == 'linux-x86_64'
         shell: bash

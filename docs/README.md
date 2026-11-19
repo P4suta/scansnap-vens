@@ -30,7 +30,13 @@ dns-sd -R "ScanSnap iX1300 (vensd)" _uscan._tcp local 8090 \
   uuid=9ff23966-94ee-48d8-9284-1e1e09ff7271 pdl=image/jpeg cs=color is=adf duplex=T
 ```
 
-On Windows, run `vensd.exe` from PowerShell.
+On Windows, use the following PowerShell command for button capture.
+Substitute the scanner's address and an existing writable folder.
+
+```powershell
+.\vensd.exe --address 192.0.2.7 --consume "$env:USERPROFILE\Documents\Scans"
+```
+
 The daemon registers the eSCL service with Windows after it starts listening.
 If it reports a registration error, clients can use the bridge address and `/eSCL` path directly.
 
