@@ -34,7 +34,7 @@ On Windows, use the following PowerShell command for button capture.
 Substitute the scanner's address and an existing writable folder.
 
 ```powershell
-.\vensd.exe --address 192.0.2.7 --consume "$env:USERPROFILE\Documents\Scans"
+vensd.exe --address 192.0.2.7 --consume "$env:USERPROFILE\Documents\Scans"
 ```
 
 The daemon registers the eSCL service with Windows after it starts listening.

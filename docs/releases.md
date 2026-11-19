@@ -78,6 +78,7 @@ if (((Get-Content -LiteralPath $record) -join "`n") -cne ($expected -join "`n"))
 Exercise the signed commands from the extracted ZIP and record the checksum of the rebuilt ZIP.
 Attach the attested `*.authenticode-sha256` file unchanged with the signed ZIP.
 
+Confirm that the [release immutability endpoint](https://docs.github.com/en/rest/repos/repos#check-if-immutable-releases-are-enabled-for-a-repository) reports `"enabled": true`.
 When the candidate is ready for publication, make a signed `vX.Y.Z` tag at the selected commit and verify its signature.
 Push the selected tag to GitHub.
 Create a GitHub release draft for the existing tag and attach the complete source archive, binaries, dependency inventory, and final `SHA256SUMS`.
