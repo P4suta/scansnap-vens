@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-
 use vens_escl::uuid::Uuid;
 
 /// The DNS-SD service type of eSCL over plain HTTP.
@@ -25,16 +23,25 @@ pub fn txt_record(uuid: Uuid) -> [String; 9] {
 /// Renders an Avahi static service file that advertises the bridge on `port`.
 #[must_use]
 pub fn avahi_service(port: u16, uuid: Uuid) -> String {
-    let records = txt_record(uuid)
-        .iter()
-        .fold(String::new(), |mut records, entry| {
-            let _ = writeln!(records, "    <txt-record>{entry}</txt-record>");
-            records
-        });
+    let mut records = String::new();
+    for entry in txt_record(uuid) {
+        records.push_str("    <txt-record>");
+        records.push_str(&entry);
+        records.push_str("</txt-record>\n");
+    }
     format!(
         "<?xml version=\"1.0\" standalone=\"no\"?>\n\
          <!DOCTYPE service-group SYSTEM \"avahi-service.dtd\">\n\
          <service-group>\n  <name replace-wildcards=\"yes\">{NAME} on %h</name>\n  <service>\n\
          \x20   <type>{SERVICE_TYPE}</type>\n    <port>{port}</port>\n{records}  </service>\n</service-group>\n"
     )
+}
+
+/// Registers the eSCL service through the Windows responder.
+///
+/// # Errors
+/// Returns the Windows registration error.
+#[cfg(windows)]
+pub fn register_with_windows(port: u16, uuid: Uuid) -> std::io::Result<()> {
+    windows_dns_sd::register(NAME, SERVICE_TYPE, port, &txt_record(uuid))
 }

@@ -4,7 +4,8 @@
 
 Choose the archive for your platform when the [release](https://github.com/P4suta/scansnap-vens/releases) provides one.
 The Linux archive targets x86-64 on Ubuntu 24.04, and the macOS archive targets Apple silicon.
-Unpack the archive and place `vens` and `vensd` in a directory on your path.
+The Windows ZIP targets x64 on Windows 10 or later and contains `vens.exe` and `vensd.exe`.
+Unpack the archive and place the two commands in a directory on your path.
 For a source release, use the [source installation commands](../README.md#installation).
 
 ## Connect to the scanner
@@ -28,6 +29,10 @@ dns-sd -R "ScanSnap iX1300 (vensd)" _uscan._tcp local 8090 \
   txtvers=1 vers=2.0 rs=eSCL 'ty=ScanSnap iX1300' \
   uuid=9ff23966-94ee-48d8-9284-1e1e09ff7271 pdl=image/jpeg cs=color is=adf duplex=T
 ```
+
+On Windows, run `vensd.exe` from PowerShell.
+The daemon registers the eSCL service with Windows after it starts listening.
+If it reports a registration error, clients can use the bridge address and `/eSCL` path directly.
 
 The client notes explain how Image Capture and sane-airscan use the bridge.
 [eSCL client behavior](escl-client-behavior.md)

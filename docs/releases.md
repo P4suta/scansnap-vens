@@ -24,7 +24,9 @@ gh workflow run build-release-candidate.yml --ref main \
 ```
 
 The job checks the locked version and exercises both commands from each archive.
-Download the Linux and macOS artifacts from the same successful run within seven days.
+Download the platform artifacts from the same successful run within seven days.
+The Windows job runs for sources that include the Windows responder.
+It extracts the ZIP and exercises discovery and the capabilities request with the archived daemon.
 The Linux artifact includes the source archive and a CycloneDX inventory.
 The build compares the inventory with every tracked Cargo lockfile.
 Check each downloaded set with its `SHA256SUMS` file.
@@ -44,6 +46,19 @@ Before distributing the macOS archive, sign both executables with Developer ID A
 [Submit the signed ZIP to Apple for notarization](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 After acceptance, check both signatures and execute the commands from the signed distribution on Apple silicon.
 Use the final signed ZIP when calculating its release checksum.
+
+For Windows, sign `vens.exe` and `vensd.exe` with [SSL.com eSigner](https://www.ssl.com/guide/esigner-codesigntool-command-guide/) and a timestamp.
+Rebuild the ZIP with the signed commands, the license files, and `SOURCE_COMMIT`.
+Unpack the rebuilt Windows ZIP.
+Verify both commands with [SignTool](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool).
+Require exit code zero and the intended signer for each command.
+
+```powershell
+signtool verify /all /pa /tw /v .\vens.exe
+signtool verify /all /pa /tw /v .\vensd.exe
+```
+
+Exercise the signed commands from the extracted ZIP and record the checksum of the rebuilt ZIP.
 
 When the candidate is ready for publication, make a signed `vX.Y.Z` tag at the selected commit and verify its signature.
 Push the selected tag to GitHub.
